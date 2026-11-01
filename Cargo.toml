@@ -1,0 +1,15 @@
+[package]
+name = "fastplay-server"
+version = "0.1.0"
+edition = "2021"
+description = "Headless authoritative server for a 4-player dominoes game"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dashmap = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.8"
+futures-util = "0.3"
