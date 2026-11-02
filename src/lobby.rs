@@ -30,7 +30,7 @@ use dashmap::DashMap;
 use rand::{seq::SliceRandom, thread_rng};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::game::{GameState, MoveError, Outcome, Seat, SEAT_COUNT, Side, Tile};
+use crate::game::{GameState, MoveError, Outcome, Seat, SEAT_COUNT, Side, TableSide, Tile};
 use crate::protocol::{
     game_state_view, ClientToServer, PublicRoomState, PublicSeat, PublicTile, RoomPhase,
     ServerToClient,
@@ -80,6 +80,7 @@ struct Occupant {
     player_id: PlayerId,
     name: String,
     outbox: Outbox,
+    table_side: TableSide,
 }
 
 /// Manages all concurrent game rooms. Shared across connection tasks via
@@ -299,7 +300,14 @@ impl Room {
         let Some(seat) = inner.seats.iter().position(Option::is_none) else {
             return Err(format!("room {:?} already has all four seats taken", self.code));
         };
-        inner.seats[seat] = Some(Occupant { player_id: player, name: name.to_owned(), outbox });
+        let table_side = match seat {
+            0 => TableSide::North,
+            1 => TableSide::East,
+            2 => TableSide::South,
+            3 => TableSide::West,
+            _ => unreachable!(),
+        };
+        inner.seats[seat] = Some(Occupant { player_id: player, name: name.to_owned(), outbox, table_side });
 
         // Publish the room binding only after a successful seating.
         broadcast_room_state(&self.code, &inner);
@@ -411,6 +419,7 @@ fn broadcast_room_state(code: &str, inner: &RoomInner) {
                 seat: seat as u8,
                 player_id: o.player_id,
                 name: o.name.clone(),
+                table_side: o.table_side,
             })
         })
         .collect();
@@ -456,56 +465,79 @@ mod tests {
     use crate::protocol::Side;
     type Event = ServerToClient;
 
-    /// Registers `n` fake connections and returns their active receivers.
-    async fn connections(lobby: &Lobby, n: u64) -> Vec<mpsc::UnboundedReceiver<Event>> {
+    /// Registers `n` fake connections and hands back each one's minted id with
+    /// its live receiver. Ids come from the lobby, so no test may assume where
+    /// the counting starts (they used to hardcode `1..=4` while the lobby mints
+    /// from `0`, which left every one of them joining an unregistered socket).
+    async fn connections(lobby: &Lobby, n: u64) -> Vec<(PlayerId, mpsc::UnboundedReceiver<Event>)> {
         (0..n)
             .map(|_| {
                 let id = lobby.next_player_id();
-                lobby.register(id)
+                (id, lobby.register(id))
             })
             .collect()
     }
 
-    fn hand_of_7(event: &Event) -> bool {
-        matches!(event, Event::HandDealt { hand, .. } if hand.len() == 7)
-    }
-
-    async fn fill_table() -> (Lobby, Vec<mpsc::UnboundedReceiver<Event>>) {
+    /// A seated four-seat table: join order is seat order, so `seats[i]` is the
+    /// occupant of seat `i`.
+    async fn fill_table() -> (Lobby, Vec<(PlayerId, mpsc::UnboundedReceiver<Event>)>) {
         let lobby = Lobby::new();
-        let rx = connections(&lobby, 4).await;
-        for id in 1..=4u64 {
-            lobby.join(id, "a", &format!("p{id}")).await.expect("seat available");
+        let mut seats = connections(&lobby, 4).await;
+        for (id, _) in seats.iter_mut() {
+            lobby.join(*id, "a", &format!("p{id}")).await.expect("seat available");
         }
-        (lobby, rx)
+        (lobby, seats)
     }
 
     #[tokio::test]
     async fn fourth_join_deals_and_every_seat_gets_its_private_hand() {
-        let (_lobby, mut rx) = fill_table().await;
-        for r in rx.iter_mut() {
-            let events = (0..3).map(|_| r.try_recv().expect("event")).collect::<Vec<_>>();
-            assert!(events.iter().all(|e| hand_of_7(e)), "each seat got 7 tiles: {events:?}");
-            assert!(events.iter().any(|e| matches!(e, Event::GameStateUpdate { .. })));
+        let (_lobby, mut seats) = fill_table().await;
+        for (seat, (_, rx)) in seats.iter_mut().enumerate() {
+            // A seat is told the roster once per join it was already present
+            // for, then handed its tiles and the opening snapshot; drain
+            // everything and assert on what arrived, not on its position.
+            let (mut hands, mut updates, mut roster) = (0, 0, None::<PublicRoomState>);
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::HandDealt { seat: dealt, hand } => {
+                        assert_eq!(dealt as usize, seat, "a hand went to the wrong seat");
+                        assert_eq!(hand.len(), 7, "a double-six hand is seven tiles");
+                        hands += 1;
+                    }
+                    Event::GameStateUpdate { .. } => updates += 1,
+                    Event::RoomState { room } => roster = Some(room),
+                    other => panic!("unexpected event at seat {seat}: {other:?}"),
+                }
+            }
+            let roster = roster.expect("every seat is told the table is full");
+            assert_eq!(roster.you, seat, "the roster is personalized per recipient");
+            assert_eq!(roster.seats.len(), SEAT_COUNT);
+            // The roster is published a step before the deal inside the same
+            // room lock, so it still reads `waiting`; the client routes on the
+            // snapshot that follows it, never on this field.
+            assert_eq!(roster.phase, RoomPhase::Waiting);
+            assert_eq!(hands, 1, "seat {seat} holds one private hand, not a copy per seat");
+            assert_eq!(updates, 1, "seat {seat} saw exactly the opening snapshot");
         }
     }
 
     #[tokio::test]
     async fn full_room_rejects_fifth_seeker() {
-        let (lobby, mut _rx) = fill_table().await;
-        let mut rx5 = connections(&lobby, 1).await.pop().expect("one receiver");
-        lobby.join(5, "a", "latecomer").await.expect_err("room is full");
+        let (lobby, mut _seats) = fill_table().await;
+        let (latecomer, mut rx5) = connections(&lobby, 1).await.pop().expect("one receiver");
+        lobby.join(latecomer, "a", "latecomer").await.expect_err("room is full");
         assert!(matches!(rx5.try_recv(), Ok(Event::MoveRejected { .. })));
     }
 
     #[tokio::test]
     async fn out_of_turn_play_is_rejected_to_the_offender_only() {
-        let (lobby, mut rx) = fill_table().await;
-        // Player ids seat in join order: player i+1 sits at seat i. Learn the
-        // opener from the post-deal update and each hand from its recipient.
+        let (lobby, mut seats) = fill_table().await;
+        // Join order is seat order. Learn the opener from the post-deal update
+        // and each hand from its recipient.
         let mut hands: [Option<Vec<PublicTile>>; 4] = std::array::from_fn(|_| None);
         let mut turn = 0usize;
-        for r in rx.iter_mut() {
-            while let Ok(event) = r.try_recv() {
+        for (_, rx) in seats.iter_mut() {
+            while let Ok(event) = rx.try_recv() {
                 match event {
                     Event::HandDealt { seat, hand } => hands[seat as usize] = Some(hand),
                     Event::GameStateUpdate { state } => turn = state.turn,
@@ -514,7 +546,7 @@ mod tests {
             }
         }
         let offender_seat = (turn + 1) % SEAT_COUNT;
-        let offender = offender_seat as u64 + 1;
+        let offender = seats[offender_seat].0;
         let tile = hands[offender_seat].as_ref().expect("hand was dealt")[0];
 
         lobby
@@ -523,13 +555,13 @@ mod tests {
 
         // The offender is told exactly once; nothing fans out to anyone.
         let mut rejections = 0;
-        for (player, r) in rx.iter_mut().enumerate() {
-            while let Ok(event) = r.try_recv() {
+        for (seat, (_, rx)) in seats.iter_mut().enumerate() {
+            while let Ok(event) = rx.try_recv() {
                 match &event {
                     Event::MoveRejected { reason } if reason == "it is not your turn" => {
                         rejections += 1;
                     }
-                    other => panic!("unexpected fan-out to player {}: {other:?}", player + 1),
+                    other => panic!("unexpected fan-out to seat {seat}: {other:?}"),
                 }
             }
         }
@@ -538,58 +570,72 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_voids_a_running_game_and_frees_the_seat() {
-        let (lobby, mut rx) = fill_table().await;
-        lobby.handle_disconnect(1).await;
+        let (lobby, mut seats) = fill_table().await;
+        let north = seats[0].0;
+        lobby.handle_disconnect(north).await;
         // Someone must observe the abandon flow: farewell, terminating update,
-        // and a roster refresh reflecting the vacant seat.
-        let (mut bye, mut ended, mut refresh) = (false, false, false);
-        for r in rx.iter_mut() {
-            while let Ok(event) = r.try_recv() {
+        // and a final roster that no longer lists the departed seat. The
+        // departure broadcasts after the joins, so only the LAST roster may
+        // show the seat as vacant.
+        let (mut bye, mut voided, mut freed) = (false, false, false);
+        for (_, rx) in seats.iter_mut() {
+            let mut roster = None;
+            while let Ok(event) = rx.try_recv() {
                 match &event {
                     Event::OpponentDisconnected { seat, .. } => {
                         bye = true;
-                        assert_eq!(*seat, 0, "sitting player 1 vacated seat 0");
+                        assert_eq!(*seat, 0, "the seat-0 occupant vacated seat 0");
                     }
                     Event::GameStateUpdate { state } => {
-                        ended = true;
-                        let result = state.result.expect("voided game reports its result");
-                        assert_eq!(result.reason, EndReason::Abandoned);
-                        assert_eq!(result.winner, None);
+                        // The opening snapshot is in this queue too; only the
+                        // one that carries a result is the void.
+                        if let Some(result) = state.result {
+                            voided = true;
+                            assert_eq!(result.reason, EndReason::Abandoned);
+                            assert_eq!(result.winner, None);
+                        }
                     }
-                    Event::RoomState { room } => {
-                        refresh = true;
-                        assert!(room.seats.iter().all(|s| s.seat != 0));
-                    }
+                    Event::RoomState { room } => roster = Some(room.clone()),
                     _ => {}
                 }
             }
+            // Only survivors learn the seat is free: the departed socket's
+            // last roster still shows a full table.
+            if roster.is_some_and(|roster| roster.seats.iter().all(|s| s.seat != 0)) {
+                freed = true;
+            }
         }
-        assert!(bye && ended && refresh, "abandon flow reached the table");
+        assert!(bye && voided, "the abandon flow reached the table");
+        assert!(freed, "a survivor's final roster drops the departed seat");
         assert!(lobby.room_exists("a"), "three seats remain");
     }
 
     #[tokio::test]
     async fn last_departure_prunes_the_empty_room() {
         let lobby = Lobby::new();
-        let mut rx = connections(&lobby, 2).await;
-        lobby.join(1, "prune", "solo").await.expect("seat");
+        let seats = connections(&lobby, 2).await;
+        let solo = seats[0].0;
+        lobby.join(solo, "prune", "solo").await.expect("seat");
         assert!(lobby.room_exists("prune"));
-        lobby.handle_disconnect(1).await;
-        lobby.handle_disconnect(2).await;
+        lobby.handle_disconnect(solo).await;
+        // Never seated, so this departure must not be what empties the room.
+        lobby.handle_disconnect(seats[1].0).await;
         assert!(!lobby.room_exists("prune"), "empty rooms must be pruned");
-        let _ = rx.pop();
     }
 
     #[tokio::test]
     async fn malformed_room_code_and_name_are_rejected() {
         let lobby = Lobby::new();
-        let mut rx = connections(&lobby, 1).await.pop().expect("one receiver");
-        lobby.join(1, "   ", "ok name").await;
+        let (id, mut rx) = connections(&lobby, 1).await.pop().expect("one receiver");
+        assert!(lobby.join(id, "   ", "ok name").await.is_err(), "a blank room code is refused");
         assert!(matches!(rx.try_recv(), Ok(Event::MoveRejected { .. })));
-        lobby.join(1, "waaaaaaaaaaaaaaaaaaaaaaaaaay-too-long", "ok name").await;
+        assert!(
+            lobby.join(id, "waaaaaaaaaaaaaaaaaaaaaaaaaay-too-long", "ok name").await.is_err(),
+            "an over-long room code is refused"
+        );
         assert!(matches!(rx.try_recv(), Ok(Event::MoveRejected { .. })));
-        lobby.join(1, "ok", "     ").await;
+        assert!(lobby.join(id, "ok", "     ").await.is_err(), "a blank name is refused");
         assert!(matches!(rx.try_recv(), Ok(Event::MoveRejected { .. })));
-        assert!(!lobby.room_exists("ok"));
+        assert!(!lobby.room_exists("ok"), "a refused join must not leave a room behind");
     }
 }

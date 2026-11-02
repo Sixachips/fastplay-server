@@ -107,6 +107,16 @@ pub enum Side {
     Right,
 }
 
+/// A player's position around the square table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableSide {
+    North,
+    East,
+    South,
+    West,
+}
+
 /// The linear layout of played tiles. Each tile is stored in orientation:
 /// `.a` is the pip facing left, `.b` the pip facing right, so the chain reads
 /// naturally left to right.

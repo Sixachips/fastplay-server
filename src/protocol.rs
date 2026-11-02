@@ -25,7 +25,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::game::{self, GameResult, GameState, SEAT_COUNT};
+use crate::game::{self, GameResult, GameState, SEAT_COUNT, TableSide};
 
 /// Which end of the linear board a tile is played on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +129,7 @@ pub struct PublicSeat {
     pub seat: u8,
     pub player_id: u64,
     pub name: String,
+    pub table_side: TableSide,
 }
 
 /// Snapshot of a room sent on join and on every membership change. It is
