@@ -313,8 +313,10 @@ impl Room {
         broadcast_room_state(&self.code, &inner);
 
         // Deal as soon as the table is full and no live game is running. When
-        // a finished game lingers, the next refill starts a new one — the
-        // room stays visible in the `Finished` phase until then.
+        // a finished game lingers, the next refill starts a new one; until
+        // that snapshot lands, `room_phase` reports the room as `Waiting`
+        // (`Finished` is never emitted), and clients route on the game's
+        // own `result` field, not the phase.
         if inner.seats.iter().all(Option::is_some)
             && inner.game.as_ref().is_none_or(|game| game.is_finished())
         {
@@ -461,8 +463,8 @@ impl Default for Lobby {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::EndReason;
-    use crate::protocol::Side;
+    use crate::game::{EndReason, HAND_SIZE, TILE_COUNT};
+    use crate::protocol::{PublicGameState, Side};
     type Event = ServerToClient;
 
     /// Registers `n` fake connections and hands back each one's minted id with
@@ -637,5 +639,314 @@ mod tests {
         assert!(lobby.join(id, "ok", "     ").await.is_err(), "a blank name is refused");
         assert!(matches!(rx.try_recv(), Ok(Event::MoveRejected { .. })));
         assert!(!lobby.room_exists("ok"), "a refused join must not leave a room behind");
+    }
+
+    /// First `(tile, side)` placement fitting the public ends, mirroring what
+    /// a client's legality layer computes from its own hand. `None` means the
+    /// seat must pass — a mismatch here is a bug if the engine disagrees.
+    fn first_legal(hand: &[PublicTile], left_end: Option<u8>, right_end: Option<u8>) -> Option<(PublicTile, Side)> {
+        let (left, right) = match (left_end, right_end) {
+            (Some(l), Some(r)) => (l, r),
+            _ => return hand.first().copied().map(|tile| (tile, Side::Right)), // empty board: any tile
+        };
+        hand.iter().find_map(|&tile| {
+            if tile.left == left || tile.right == left {
+                Some((tile, Side::Left))
+            } else if tile.left == right || tile.right == right {
+                Some((tile, Side::Right))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Pulls the single pending `GameStateUpdate` from every seat's outbox,
+    /// failing on any rejection or stray event. All seats must see equal
+    /// snapshots; returns the one every seat received.
+    fn unanimous_update(seats: &mut [(PlayerId, mpsc::UnboundedReceiver<Event>)]) -> PublicGameState {
+        let mut shared: Option<PublicGameState> = None;
+        for (seat, (_, rx)) in seats.iter_mut().enumerate() {
+            let mut pending = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                pending.push(event);
+            }
+            let mut updates = pending.iter().filter_map(|event| match event {
+                Event::GameStateUpdate { state } => Some(state.clone()),
+                Event::MoveRejected { reason } => panic!("seat {seat} rejected: {reason}"),
+                other => panic!("seat {seat} saw a stray event mid-game: {other:?}"),
+            });
+            let first = updates.next().unwrap_or_else(|| panic!("seat {seat} got no update"));
+            assert!(updates.next().is_none(), "seat {seat} got two updates for one command");
+            match &shared {
+                None => shared = Some(first),
+                Some(previous) => assert_eq!(previous, &first, "seats observed divergent snapshots"),
+            }
+        }
+        shared.expect("every seat saw the update")
+    }
+
+    #[tokio::test]
+    async fn a_whole_game_over_the_wire_keeps_counts_and_turn_walk_consistent() {
+        let (lobby, mut seats) = fill_table().await;
+
+        // Track each seat's private hand exactly as its client would, from
+        // the `HandDealt` it received, and cross-check every broadcast.
+        let mut hands: [Vec<PublicTile>; SEAT_COUNT] = std::array::from_fn(|_| Vec::new());
+        let mut state: Option<PublicGameState> = None;
+        for (seat, (_, rx)) in seats.iter_mut().enumerate() {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::HandDealt { seat: dealt, hand } => {
+                        assert_eq!(dealt as usize, seat);
+                        hands[seat] = hand;
+                    }
+                    Event::GameStateUpdate { state: snapshot } => state = Some(snapshot),
+                    Event::RoomState { .. } => {}
+                    other => panic!("unexpected event at seat {seat}: {other:?}"),
+                }
+            }
+        }
+        let mut state = state.expect("opening snapshot");
+        assert_eq!(state.hand_counts, [7, 7, 7, 7]);
+        assert!(state.result.is_none());
+
+        let mut pass_run = 0usize;
+        let mut rejected_off_turn = false;
+        let mut ended = None;
+        for _step in 0..400 {
+            let actor = state.turn;
+
+            // Once, mid-game, have a seat that is NOT up try to pass: it must
+            // be refused on its own socket without disturbing anyone else.
+            if !rejected_off_turn && actor != 0 {
+                rejected_off_turn = true;
+                let idler = (actor + 2) % SEAT_COUNT;
+                lobby.handle_event(seats[idler].0, ClientToServer::PassTurn).await;
+                let mut saw_rejection = false;
+                for (seat, (_, rx)) in seats.iter_mut().enumerate() {
+                    let mut stray = Vec::new();
+                    while let Ok(event) = rx.try_recv() {
+                        stray.push(event);
+                    }
+                    if seat == idler {
+                        assert!(
+                            stray.iter().any(|event| matches!(event, Event::MoveRejected { reason } if reason == "it is not your turn")),
+                            "the off-turn passer was not told why"
+                        );
+                        saw_rejection = true;
+                    } else {
+                        assert!(stray.is_empty(), "an off-turn attempt must not fan out to seat {seat}");
+                    }
+                }
+                assert!(saw_rejection);
+            }
+
+            match first_legal(&hands[actor], state.left_end, state.right_end) {
+                Some((tile, side)) => {
+                    lobby.handle_event(seats[actor].0, ClientToServer::PlayTile { tile, side }).await;
+                    let before = hands[actor].len();
+                    hands[actor].retain(|held| *held != tile);
+                    assert_eq!(hands[actor].len(), before - 1, "the played tile must leave the hand exactly once");
+                    pass_run = 0;
+                }
+                None => {
+                    // The engine must agree that this seat cannot play: a
+                    // rejection here means its legality check and ours diverged.
+                    lobby.handle_event(seats[actor].0, ClientToServer::PassTurn).await;
+                    pass_run += 1;
+                }
+            }
+
+            let next = unanimous_update(&mut seats);
+            for seat in 0..SEAT_COUNT {
+                assert_eq!(
+                    next.hand_counts[seat],
+                    hands[seat].len() as u8,
+                    "broadcast counts must mirror the hidden hand of seat {seat}"
+                );
+            }
+            assert_eq!(
+                next.board.len() + usize::from(next.hand_counts.iter().sum::<u8>()),
+                TILE_COUNT,
+                "28 tiles: on the board or in a seat's hand"
+            );
+            assert_eq!(usize::from(next.consecutive_passes), pass_run);
+            match next.result {
+                None => {
+                    assert_eq!(next.turn, (actor + 1) % SEAT_COUNT, "turn walks one seat to the right");
+                }
+                Some(result) => {
+                    assert_eq!(next.turn, actor, "the turn freezes when the game ends");
+                    match result.reason {
+                        EndReason::HandEmpty => {
+                            assert_eq!(result.winner, Some(actor), "the seat that just emptied its hand wins");
+                            assert!(hands[actor].is_empty());
+                        }
+                        EndReason::Blocked => {
+                            // Winner = the absolute seat with the fewest pips,
+                            // recomputed from the hands the clients were dealt.
+                            let pips: [u8; SEAT_COUNT] = std::array::from_fn(|seat| {
+                                hands[seat].iter().map(|tile| tile.left + tile.right).sum()
+                            });
+                            let min = pips.iter().copied().min().expect("four seats");
+                            let fewest: Vec<usize> = (0..SEAT_COUNT).filter(|&s| pips[s] == min).collect();
+                            assert_eq!(
+                                result.winner,
+                                if fewest.len() == 1 { Some(fewest[0]) } else { None },
+                                "blocked winner must be the pip-minimum seat index (pips: {pips:?})"
+                            );
+                        }
+                        EndReason::Abandoned => unreachable!("nobody left in this test"),
+                    }
+                    ended = Some(result);
+                    break;
+                }
+            }
+            state = next;
+        }
+        assert!(ended.is_some(), "the game must terminate: every command either plays or blocks");
+
+        // A finished game refuses any further command from any seat.
+        for (id, _) in seats.iter() {
+            lobby.handle_event(*id, ClientToServer::PassTurn).await;
+        }
+        for (seat, (_, rx)) in seats.iter_mut().enumerate() {
+            assert!(
+                matches!(rx.try_recv(), Ok(Event::MoveRejected { reason }) if reason == "the game is not active"),
+                "seat {seat} must be told the game is over, once"
+            );
+            assert!(rx.try_recv().is_err(), "one rejection per offender");
+        }
+    }
+
+    #[tokio::test]
+    async fn seats_stay_absolute_through_disconnect_reseat_and_redeal() {
+        let (lobby, mut seats) = fill_table().await;
+        let departed = seats[1].0;
+        let (survivor_0, survivor_2, survivor_3) = (seats[0].0, seats[2].0, seats[3].0);
+        for (_, rx) in seats.iter_mut() {
+            while rx.try_recv().is_ok() {} // drain the opening fan-out
+        }
+
+        lobby.handle_disconnect(departed).await;
+
+        // The hole must stay at index 1: survivors keep their original seat
+        // numbers, and the vacant seat is simply absent — never renumbered.
+        for index in [0usize, 2, 3] {
+            let mut bye = None;
+            let mut voided = None;
+            let mut roster = None;
+            while let Ok(event) = seats[index].1.try_recv() {
+                match event {
+                    Event::OpponentDisconnected { player, seat } => {
+                        assert_eq!(seat as usize, 1, "the departee vacated seat 1");
+                        bye = Some(player);
+                    }
+                    Event::GameStateUpdate { state } => {
+                        if let Some(result) = state.result {
+                            assert_eq!(result.reason, EndReason::Abandoned);
+                            assert_eq!(result.winner, None);
+                            voided = Some(result);
+                        }
+                    }
+                    Event::RoomState { room } => roster = Some(room),
+                    other => panic!("seat {index} saw a stray event: {other:?}"),
+                }
+            }
+            assert_eq!(bye.as_deref(), Some(format!("p{departed}").as_str()));
+            assert!(voided.is_some(), "the live game was voided");
+            let roster = roster.expect("final roster");
+            let listed: Vec<usize> = roster.seats.iter().map(|seat| seat.seat as usize).collect();
+            assert_eq!(listed, vec![0, 2, 3], "seat numbering survives the departure unshifted");
+            for public in &roster.seats {
+                let expected_id = match public.seat as usize {
+                    0 => survivor_0,
+                    2 => survivor_2,
+                    3 => survivor_3,
+                    other => panic!("seat {other} should be vacant"),
+                };
+                assert_eq!(public.player_id, expected_id, "survivors keep their seats");
+            }
+            assert_eq!(roster.you, index, "personalized rosters name the recipient's absolute seat");
+        }
+
+        // A newcomer takes the hole, seat 1 — the first vacant index, not a
+        // fresh tail or a compacted slot.
+        let (refugee, mut refugee_rx) = connections(&lobby, 1).await.pop().expect("one receiver");
+        assert_eq!(
+            lobby.join(refugee, "a", "refugee").await.expect("the hole is fillable"),
+            1,
+            "the replacement must inherit the departed seat number"
+        );
+
+        // The table is full again and the abandoned game is finished, so a
+        // redeal fires: every hand lands on its owner's ABSOLUTE seat and the
+        // survivors are dealt exactly where they sat before the departure.
+        /// Pulls one queue's redeal fan-out: the private hand addressed to
+        /// this recipient, the live opening snapshot, and the latest roster.
+        fn drain_redeal(rx: &mut mpsc::UnboundedReceiver<Event>) -> (Option<(u8, Vec<PublicTile>)>, Option<PublicGameState>, Option<PublicRoomState>) {
+            let (mut hand, mut opening, mut roster) = (None, None, None);
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::HandDealt { seat, hand: dealt } => {
+                        assert!(hand.is_none(), "an owner was dealt twice");
+                        hand = Some((seat, dealt));
+                    }
+                    Event::GameStateUpdate { state } => {
+                        if state.result.is_none() {
+                            opening = Some(state);
+                        }
+                    }
+                    Event::RoomState { room } => roster = Some(room),
+                    Event::OpponentDisconnected { .. } => panic!("nobody left during the reseat redeal"),
+                    Event::MoveRejected { reason } => panic!("rejected during reseat: {reason}"),
+                }
+            }
+            (hand, opening, roster)
+        }
+
+        let (refugee_hand, opening, refugee_roster) = drain_redeal(&mut refugee_rx);
+        let opening = opening.expect("the redeal broadcast a fresh snapshot to the newcomer");
+        let mut hands_by_seat: [Option<(u8, Vec<PublicTile>)>; SEAT_COUNT] = [None, refugee_hand, None, None];
+        let mut rosters = [None, refugee_roster, None, None];
+        for index in [0usize, 2, 3] {
+            let (hand, survivor_opening, roster) = drain_redeal(&mut seats[index].1);
+            assert_eq!(
+                survivor_opening.as_ref(),
+                Some(&opening),
+                "seat {index}: every survivor must see the same redeal snapshot as the newcomer"
+            );
+            hands_by_seat[index] = hand;
+            rosters[index] = roster;
+        }
+        for (index, entry) in hands_by_seat.into_iter().enumerate() {
+            let (seat, dealt) = entry.unwrap_or_else(|| panic!("the owner of seat {index} got no redeal hand"));
+            assert_eq!(seat as usize, index, "the HandDealt tag for the owner of seat {index} must be {index}");
+            assert_eq!(dealt.len(), HAND_SIZE);
+        }
+        let roster = rosters[3].clone().expect("survivors saw the reseat roster");
+        assert_eq!(rosters[0].as_ref().map(|r| r.you), Some(0), "personalization stays absolute");
+        assert_eq!(rosters[2].as_ref().map(|r| r.you), Some(2));
+        assert_eq!(roster.seats.len(), SEAT_COUNT);
+        for public in &roster.seats {
+            let expected = match public.seat as usize {
+                0 => survivor_0,
+                1 => refugee,
+                2 => survivor_2,
+                3 => survivor_3,
+                other => unreachable!("{other}"),
+            };
+            assert_eq!(public.player_id, expected, "seat {} kept its identity across the reseat", public.seat);
+            let expected_side = match public.seat as usize {
+                0 => TableSide::North,
+                1 => TableSide::East,
+                2 => TableSide::South,
+                _ => TableSide::West,
+            };
+            assert_eq!(public.table_side, expected_side, "table sides are pinned to seats, not occupants");
+        }
+        assert_eq!(opening.hand_counts, [7, 7, 7, 7]);
+        assert!(opening.result.is_none(), "a live game carries no stale result");
+        assert!(opening.turn < SEAT_COUNT, "the new opener is an absolute seat");
     }
 }

@@ -687,6 +687,196 @@ mod tests {
         assert!(game.is_finished());
     }
 
+    /// Snapshot of everything a rejected command must leave untouched.
+    #[derive(Debug, PartialEq)]
+    struct Fingerprint {
+        turn: Seat,
+        chain: Vec<Tile>,
+        counts: [usize; SEAT_COUNT],
+        hands: [Vec<Tile>; SEAT_COUNT],
+        passes_in_row: usize,
+        result: Option<GameResult>,
+    }
+
+    impl Fingerprint {
+        fn of(game: &GameState) -> Self {
+            Self {
+                turn: game.turn(),
+                chain: game.board().chain().to_vec(),
+                counts: game.hand_counts(),
+                hands: std::array::from_fn(|seat| game.hand(seat).to_vec()),
+                passes_in_row: game.passes_in_row(),
+                result: game.result(),
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_commands_leave_every_field_untouched() {
+        // Seat 0 opens 6|6 (keeping a spare 0|0 so the game continues); seat 1
+        // then holds one fitting tile (6|5) and one that fits neither end
+        // (1|2). Every guard below runs while it is seat 1's turn.
+        let mut game = GameState::from_hands([
+            vec![Tile::new(6, 6), Tile::new(0, 0)],
+            vec![Tile::new(6, 5), Tile::new(1, 2)],
+            vec![Tile::new(1, 1), Tile::new(1, 5)],
+            vec![Tile::new(2, 2), Tile::new(2, 4)],
+        ]);
+        game.play(0, Tile::new(6, 6), Side::Right).expect("opening move");
+        assert_eq!(game.turn(), 1);
+        let before = Fingerprint::of(&game);
+
+        assert_eq!(game.play(0, Tile::new(6, 5), Side::Left), Err(MoveError::NotYourTurn), "the previous actor is not up again");
+        assert_eq!(game.play(2, Tile::new(1, 5), Side::Right), Err(MoveError::NotYourTurn));
+        assert_eq!(game.play(3, Tile::new(2, 4), Side::Right), Err(MoveError::NotYourTurn));
+        assert_eq!(
+            game.play(1, Tile::new(1, 1), Side::Right),
+            Err(MoveError::TileNotInHand),
+            "1|1 belongs to seat 2; the acting seat's hand is the only source"
+        );
+        assert_eq!(game.play(1, Tile::new(1, 2), Side::Left), Err(MoveError::TileDoesNotFit));
+        assert_eq!(game.play(1, Tile::new(1, 2), Side::Right), Err(MoveError::TileDoesNotFit));
+        assert_eq!(game.play(1, Tile::new(3, 3), Side::Right), Err(MoveError::TileNotInHand));
+        assert_eq!(game.pass(1), Err(MoveError::IllegalPass), "6|5 fits the left end");
+        assert_eq!(game.pass(0), Err(MoveError::NotYourTurn));
+        assert_eq!(game.pass(2), Err(MoveError::NotYourTurn));
+        assert_eq!(game.pass(3), Err(MoveError::NotYourTurn));
+        assert_eq!(Fingerprint::of(&game), before, "every rejected command was inert");
+
+        // A finished game rejects both commands for anyone, including the
+        // winner who just played out.
+        let mut over = GameState::from_hands([
+            vec![Tile::new(6, 6)],
+            vec![Tile::new(1, 1)],
+            vec![],
+            vec![],
+        ]);
+        assert_eq!(
+            over.play(0, Tile::new(6, 6), Side::Right),
+            Ok(Outcome::Ended(GameResult { winner: Some(0), reason: EndReason::HandEmpty }))
+        );
+        assert_eq!(over.play(0, Tile::new(6, 6), Side::Right), Err(MoveError::GameNotActive));
+        assert_eq!(over.play(1, Tile::new(1, 1), Side::Right), Err(MoveError::GameNotActive));
+        assert_eq!(over.pass(1), Err(MoveError::GameNotActive));
+    }
+
+    #[test]
+    fn starter_is_deterministic_doubles_beat_pips_and_low_seat_breaks_ties() {
+        // Equal-pip non-doubles: the lower seat opens, no matter which side
+        // of the tie the tiles sit on.
+        let a = GameState::from_hands([
+            vec![Tile::new(1, 6)],
+            vec![Tile::new(0, 1)],
+            vec![Tile::new(0, 2)],
+            vec![Tile::new(2, 5)],
+        ]);
+        assert_eq!(a.turn(), 0);
+        let b = GameState::from_hands([
+            vec![Tile::new(2, 5)],
+            vec![Tile::new(0, 1)],
+            vec![Tile::new(0, 2)],
+            vec![Tile::new(1, 6)],
+        ]);
+        assert_eq!(b.turn(), 0);
+        // Any double outranks a higher-pip non-double, per the module rules.
+        let c = GameState::from_hands([
+            vec![Tile::new(6, 5)],
+            vec![],
+            vec![Tile::new(1, 1)],
+            vec![],
+        ]);
+        assert_eq!(c.turn(), 2);
+        // The same deck dealt twice opens the same way.
+        let mut deck = Tile::full_set();
+        deck.shuffle(&mut rand::thread_rng());
+        assert_eq!(GameState::new(deck.clone()).turn(), GameState::new(deck).turn());
+    }
+
+    #[test]
+    fn every_step_walks_the_turn_exactly_one_seat_clockwise() {
+        // Scripted full cycle: seat 0 opens 6|6; every hand is six-blind
+        // except seat 3's 5|6 (one extra placement). The turn must walk
+        // 0→1→2→3→0→1→2→3 with no seat skipped or revisited, ending blocked
+        // with the lowest pips at the ABSOLUTE seat 3 — a winner taken from
+        // the pass order (3,0,1,2 → index 0) or from an occupied-seat list
+        // would report something else here.
+        let mut game = GameState::from_hands([
+            vec![Tile::new(6, 6), Tile::new(1, 1), Tile::new(0, 1)], // 3 pips left after opening
+            vec![Tile::new(2, 2), Tile::new(1, 2)],                  // 7 pips
+            vec![Tile::new(3, 3), Tile::new(4, 4)],                  // 14 pips
+            vec![Tile::new(0, 0), Tile::new(6, 5)],                  // 0 pips after the 5|6 lands
+        ]);
+        let start_tiles: usize = game.hand_counts().iter().sum();
+        assert_eq!(game.turn(), 0, "6|6 is the highest double");
+
+        game.play(0, Tile::new(6, 6), Side::Right).expect("opens");
+        assert_eq!(game.turn(), 1);
+        // Seats out of step are refused, including seat 0 (previous actor)
+        // and seats that simply try to get ahead of the queue.
+        assert_eq!(game.play(3, Tile::new(6, 5), Side::Left), Err(MoveError::NotYourTurn));
+        for seat in [0, 2, 3] {
+            assert_eq!(game.pass(seat), Err(MoveError::NotYourTurn), "seat {seat} tried early");
+        }
+
+        // Walk the table strictly +1 mod 4: passes for seats 1 and 2, the
+        // legal play for seat 3, then four consecutive passes to the block.
+        assert_eq!(game.pass(1).expect("six-blind hand"), Outcome::Continued);
+        assert_eq!(game.turn(), 2);
+        assert_eq!(game.pass(2).expect("six-blind hand"), Outcome::Continued);
+        assert_eq!(game.turn(), 3);
+        assert_eq!(game.play(3, Tile::new(6, 5), Side::Left), Ok(Outcome::Continued));
+        assert_eq!(game.turn(), 0);
+        assert_eq!(game.passes_in_row(), 0, "any play resets the pass streak");
+        for seat in 0..3 {
+            assert_eq!(game.pass(seat).expect("no 5 or 6 fits any remaining hand"), Outcome::Continued);
+            assert_eq!(game.turn(), (seat + 1) % SEAT_COUNT, "seat {seat} passes to its right-hand neighbour");
+        }
+        // The fourth consecutive pass — by seat 3, completing the full circle —
+        // blocks the game.
+        assert_eq!(
+            game.pass(3).expect("fourth consecutive pass"),
+            Outcome::Ended(GameResult { winner: Some(3), reason: EndReason::Blocked })
+        );
+
+        // The blocked winner is the absolute seat 3 (0 pips vs 3/14/14):
+        // pip_totals is seat-indexed, so `position` == seat here.
+        assert_eq!(
+            game.result(),
+            Some(GameResult { winner: Some(3), reason: EndReason::Blocked })
+        );
+        // Conservation: nothing left the table unaccounted for, and the
+        // seat-indexed counts match the hidden hands exactly after every step.
+        assert_eq!(game.hand_counts(), [2, 2, 2, 1]);
+        assert_eq!(start_tiles, game.hand_counts().iter().sum::<usize>() + game.board().len());
+        assert_eq!(game.turn(), 3, "turn freezes at the seat that sealed the block");
+        assert_eq!(game.play(3, Tile::new(0, 0), Side::Right), Err(MoveError::GameNotActive));
+        assert_eq!(game.pass(3), Err(MoveError::GameNotActive));
+    }
+
+    #[test]
+    fn blocked_winner_is_a_seat_number_even_when_the_opener_passes_last() {
+        // The opener (seat 1) also makes the sealing fourth pass, so the
+        // pip-minimum seat (0) differs from both its pass-order position
+        // (second passer, would report 2) and any occupied-list index.
+        let mut game = GameState::from_hands([
+            vec![Tile::new(0, 0)],                                     // 0 pips, but NOT the opener
+            vec![Tile::new(6, 6), Tile::new(1, 2)],                    // opener, 3 pips left
+            vec![Tile::new(2, 2)],
+            vec![Tile::new(3, 3)],
+        ]);
+        assert_eq!(game.turn(), 1);
+        game.play(1, Tile::new(6, 6), Side::Right).expect("opens");
+        for (order, seat) in [2usize, 3, 0, 1].into_iter().enumerate() {
+            let outcome = game.pass(seat).expect("no six outside the played 6|6");
+            if order == 3 {
+                assert_eq!(outcome, Outcome::Ended(GameResult { winner: Some(0), reason: EndReason::Blocked }));
+            } else {
+                assert_eq!(outcome, Outcome::Continued);
+                assert_eq!(game.turn(), (seat + 1) % SEAT_COUNT);
+            }
+        }
+    }
+
     #[test]
     fn board_reorients_tiles_and_keeps_ends_consistent() {
         let mut board = Board::default();

@@ -239,4 +239,40 @@ mod tests {
         assert!(state.left_end.is_none() && state.right_end.is_none());
         assert_eq!(state.consecutive_passes, 0);
     }
+
+    #[test]
+    fn view_indexes_turn_and_counts_by_absolute_seat() {
+        // A deterministic ordered deal: slots 0..7 of the deck go to seat 0,
+        // and so on. Seat 0 holds the highest double (6|6), so it opens;
+        // after its move the count drop must show up at `hand_counts[0]`
+        // and the turn at seat 1 — never shifted by who acted.
+        fn hand7(tiles: &[(u8, u8)]) -> Vec<game::Tile> {
+            tiles.iter().map(|&(a, b)| game::Tile::new(a, b)).collect()
+        }
+        let mut tiles: Vec<game::Tile> = Vec::with_capacity(game::TILE_COUNT);
+        tiles.extend(hand7(&[(6, 6), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6)]));
+        tiles.extend(hand7(&[(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (2, 2)]));
+        tiles.extend(hand7(&[(2, 3), (2, 4), (2, 5), (2, 6), (3, 3), (3, 4), (3, 5)]));
+        tiles.extend(hand7(&[(0, 0), (3, 6), (4, 4), (4, 5), (4, 6), (5, 5), (5, 6)]));
+        assert_eq!(tiles.len(), game::TILE_COUNT);
+        let mut game = GameState::new(tiles);
+        assert_eq!(game_state_view(&game).turn, 0, "seat 0 holds 6|6");
+
+        game.play(0, game::Tile::new(6, 6), game::Side::Right).expect("opens");
+        let view = game_state_view(&game);
+        assert_eq!(view.turn, 1, "turn sits at the absolute next seat");
+        assert_eq!(view.hand_counts, [6, 7, 7, 7], "only seat 0 lost a tile");
+        assert_eq!((view.left_end, view.right_end), (Some(6), Some(6)));
+        assert_eq!(view.board.len(), 1);
+    }
+
+    #[test]
+    fn result_winner_travels_as_a_seat_number_on_the_wire() {
+        let json = serde_json::to_value(GameResult { winner: Some(3), reason: game::EndReason::Blocked })
+            .expect("serializable");
+        assert_eq!(json, serde_json::json!({ "winner": 3, "reason": "blocked" }));
+        let draw = serde_json::to_value(GameResult { winner: None, reason: game::EndReason::Abandoned })
+            .expect("serializable");
+        assert_eq!(draw, serde_json::json!({ "winner": null, "reason": "abandoned" }));
+    }
 }
