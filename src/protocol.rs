@@ -8,6 +8,7 @@
 //! {"type": "JoinRoom", "room": "table-42", "name": "Ada"}
 //! {"type": "PlayTile", "tile": {"left": 3, "right": 4}, "side": "right"}
 //! {"type": "PassTurn"}
+//! {"type": "PlayAgain"}
 //! ```
 //!
 //! ```json
@@ -87,6 +88,11 @@ pub enum ClientToServer {
         side: Side,
     },
     PassTurn,
+    /// "Play again": this seated player is ready for the next game. When a
+    /// full table of four ready seats shares a finished (or absent) game,
+    /// the room deals a fresh one in place — no socket cycling, so no seat
+    /// can be held hostage by a stale connection.
+    PlayAgain,
 }
 
 /// Outbound messages from the server.
@@ -137,6 +143,8 @@ pub struct PublicSeat {
     pub player_id: u64,
     pub name: String,
     pub table_side: TableSide,
+    /// Whether this player has tapped "Play again" since the last deal.
+    pub ready: bool,
 }
 
 /// Snapshot of a room sent on join and on every membership change. It is
@@ -230,6 +238,9 @@ mod tests {
 
         let pass: ClientToServer = serde_json::from_str(r#"{"type": "PassTurn"}"#).expect("valid PassTurn");
         assert_eq!(pass, ClientToServer::PassTurn);
+
+        let again: ClientToServer = serde_json::from_str(r#"{"type": "PlayAgain"}"#).expect("valid PlayAgain");
+        assert_eq!(again, ClientToServer::PlayAgain);
     }
 
     #[test]

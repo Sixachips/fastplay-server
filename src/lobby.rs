@@ -81,6 +81,8 @@ struct Occupant {
     name: String,
     outbox: Outbox,
     table_side: TableSide,
+    /// Whether this player has tapped "Play again" since the last deal.
+    ready: bool,
 }
 
 /// Manages all concurrent game rooms. Shared across connection tasks via
@@ -148,6 +150,16 @@ impl Lobby {
                 self.command(id, move |seat, game| game.play(seat, tile, side)).await;
             }
             ClientToServer::PassTurn => self.command(id, |seat, game| game.pass(seat)).await,
+            ClientToServer::PlayAgain => {
+                let bound_room = self.room_binding(&id).and_then(|code| self.room_for(&code));
+                let Some(room) = bound_room else {
+                    self.reject(id, "join a room before playing".to_owned());
+                    return;
+                };
+                if let Err(reason) = room.signal_rematch(id).await {
+                    self.reject(id, reason);
+                }
+            }
         }
     }
 
@@ -307,7 +319,13 @@ impl Room {
             3 => TableSide::West,
             _ => unreachable!(),
         };
-        inner.seats[seat] = Some(Occupant { player_id: player, name: name.to_owned(), outbox, table_side });
+        inner.seats[seat] = Some(Occupant {
+            player_id: player,
+            name: name.to_owned(),
+            outbox,
+            table_side,
+            ready: false,
+        });
 
         // Publish the room binding only after a successful seating.
         broadcast_room_state(&self.code, &inner);
@@ -320,20 +338,7 @@ impl Room {
         if inner.seats.iter().all(Option::is_some)
             && inner.game.as_ref().is_none_or(|game| game.is_finished())
         {
-            let mut tiles = Tile::full_set();
-            tiles.shuffle(&mut thread_rng());
-            let game = GameState::new(tiles);
-
-            // Hands first, strictly into their owners' outboxes.
-            for (seat, occupant) in inner.seats.iter_mut().enumerate() {
-                let occupant = occupant.as_mut().expect("table is full");
-                let hand: Vec<PublicTile> =
-                    game.hand(seat).iter().copied().map(Into::into).collect();
-                let _ = occupant.outbox.send(ServerToClient::HandDealt { seat: seat as u8, hand });
-            }
-            let opening = game_state_view(&game);
-            inner.game = Some(game);
-            broadcast(&inner.seats, ServerToClient::GameStateUpdate { state: opening });
+            deal_fresh_game(&mut inner);
         }
 
         Ok(seat as u8)
@@ -406,6 +411,56 @@ impl Room {
             Err(reason) => Err(reason.to_string()),
         }
     }
+
+    /// Marks a seat ready for the next game ("Play again"). When a full
+    /// table of four ready seats shares a finished (or absent) game, the
+    /// room redeals in place — the sockets never cycle, so no seat can be
+    /// held hostage by a connection the server has not seen close yet.
+    async fn signal_rematch(&self, player: PlayerId) -> Result<(), String> {
+        let mut inner = self.inner.lock().await;
+        let seat = inner
+            .seats
+            .iter()
+            .position(|o| o.as_ref().is_some_and(|o| o.player_id == player))
+            .ok_or("you are not seated in this room")?;
+        if inner.game.as_ref().is_some_and(|game| !game.is_finished()) {
+            return Err("the current game is still in progress".to_owned());
+        }
+        inner.seats[seat].as_mut().expect("seat lookup matched").ready = true;
+
+        if inner.seats.iter().all(|o| o.as_ref().is_some_and(|o| o.ready)) {
+            deal_fresh_game(&mut inner);
+        }
+        // The roster (with readiness) lands last, so waiting seats see the
+        // flags cleared by a redeal at the same time as its opening snapshot.
+        broadcast_room_state(&self.code, &inner);
+        Ok(())
+    }
+}
+
+/// Deals a fresh game to a full table whose current game is finished (or
+/// which has never had one). Hands go straight into their owners' outboxes;
+/// the opening snapshot fans out to everyone. Every readiness flag starts the
+/// next rematch clock over.
+fn deal_fresh_game(inner: &mut RoomInner) {
+    let mut tiles = Tile::full_set();
+    tiles.shuffle(&mut thread_rng());
+    let game = GameState::new(tiles);
+
+    for occupant in inner.seats.iter_mut() {
+        if let Some(occupant) = occupant.as_mut() {
+            occupant.ready = false;
+        }
+    }
+    // Hands first, strictly into their owners' outboxes.
+    for (seat, occupant) in inner.seats.iter_mut().enumerate() {
+        let occupant = occupant.as_mut().expect("table is full");
+        let hand: Vec<PublicTile> = game.hand(seat).iter().copied().map(Into::into).collect();
+        let _ = occupant.outbox.send(ServerToClient::HandDealt { seat: seat as u8, hand });
+    }
+    let opening = game_state_view(&game);
+    inner.game = Some(game);
+    broadcast(&inner.seats, ServerToClient::GameStateUpdate { state: opening });
 }
 
 /// Sends one message to every seated player. Because `join`/`leave`/`commit`
@@ -430,6 +485,7 @@ fn broadcast_room_state(code: &str, inner: &RoomInner) {
                 player_id: o.player_id,
                 name: o.name.clone(),
                 table_side: o.table_side,
+                ready: o.ready,
             })
         })
         .collect();
@@ -1049,6 +1105,92 @@ mod tests {
             }
             assert!(closed_update, "seat {seat} saw the terminating snapshot");
             assert_eq!(reveal.expect("seat {seat} was told the game closed"), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn play_again_redeals_in_place_once_every_seat_is_ready() {
+        let (lobby, mut seats) = fill_table().await;
+        for (_, rx) in seats.iter_mut() {
+            while rx.try_recv().is_ok() {} // drain the opening deal fan-out
+        }
+
+        // While a game is live, tapping Play again is refused politely.
+        lobby.handle_event(seats[0].0, ClientToServer::PlayAgain).await;
+        let mut refused = false;
+        for (seat, (_, rx)) in seats.iter_mut().enumerate() {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::MoveRejected { reason } if seat == 0 => {
+                        assert!(reason.contains("in progress"), "reason: {reason}");
+                        refused = true;
+                    }
+                    Event::MoveRejected { reason } => panic!("seat {seat} rejected: {reason}"),
+                    other => panic!("seat {seat} saw a stray event: {other:?}"),
+                }
+            }
+        }
+        assert!(refused, "the early tap was refused on its own socket only");
+
+        // Finish the game: swap the live deal for a rigged, ended one.
+        let room = lobby.room_for("a").expect("the filled room is registered");
+        {
+            let mut inner = room.inner.lock().await;
+            let mut game = GameState::from_hands([
+                vec![Tile::new(0, 0)],
+                vec![Tile::new(1, 1)],
+                vec![Tile::new(2, 2)],
+                vec![Tile::new(3, 3)],
+            ]);
+            game.abandon();
+            inner.game = Some(game);
+        }
+
+        // Three readiness taps must not deal on their own: they only travel
+        // as roster updates, identically to every seat.
+        for actor in 0..3 {
+            lobby.handle_event(seats[actor].0, ClientToServer::PlayAgain).await;
+        }
+        for (seat, (_, rx)) in seats.iter_mut().enumerate() {
+            let mut last_roster = None;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::RoomState { room } => last_roster = Some(room),
+                    other => panic!("seat {seat} saw {other:?} before the table was ready"),
+                }
+            }
+            let roster = last_roster.expect("readiness travels in the roster");
+            assert_eq!(roster.seats.iter().filter(|s| s.ready).count(), 3, "three ready seats at seat {seat}");
+            assert_eq!(roster.seats.len(), SEAT_COUNT);
+        }
+
+        // The fourth tap lands everyone ready at once: the room redeals in
+        // place — same sockets, same seats, a fresh live game for all.
+        lobby.handle_event(seats[3].0, ClientToServer::PlayAgain).await;
+        let expected_seats: Vec<(u8, PlayerId)> =
+            seats.iter().enumerate().map(|(i, (id, _))| (i as u8, *id)).collect();
+        for (seat, (_, rx)) in seats.iter_mut().enumerate() {
+            let (mut dealt, mut opening, mut final_roster) = (None, None, None);
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::HandDealt { seat: owner, hand } => {
+                        assert_eq!(owner as usize, seat, "the redeal must land on the same seat");
+                        dealt = Some(hand);
+                    }
+                    Event::GameStateUpdate { state } => opening = Some(state),
+                    Event::RoomState { room } => final_roster = Some(room),
+                    other => panic!("seat {seat} saw {other:?} during the redeal"),
+                }
+            }
+            assert_eq!(dealt.expect("redeal hand").len(), HAND_SIZE);
+            let opening = opening.expect("redeal snapshot");
+            assert!(opening.result.is_none(), "the fresh game is live");
+            assert_eq!(opening.hand_counts, [7, 7, 7, 7]);
+            let roster = final_roster.expect("final roster");
+            assert!(roster.seats.iter().all(|s| !s.ready), "readiness resets with the deal");
+            let listed: Vec<(u8, PlayerId)> =
+                roster.seats.iter().map(|s| (s.seat, s.player_id)).collect();
+            assert_eq!(listed, expected_seats, "an in-place rematch never moves a seat");
         }
     }
 }
