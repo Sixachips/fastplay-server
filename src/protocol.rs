@@ -14,6 +14,7 @@
 //! {"type": "RoomState", "room": {"room_id": "table-42", "you": 0, "phase": "playing", "seats": [...]}}
 //! {"type": "HandDealt", "seat": 0, "hand": [{"left": 6, "right": 6}, ...]}
 //! {"type": "GameStateUpdate", "state": {"turn": 1, "board": [...], ...}}
+//! {"type": "GameClosed", "hands": [{"seat": 0, "hand": [...]}, ...]}
 //! {"type": "MoveRejected", "reason": "it is not your turn"}
 //! {"type": "OpponentDisconnected", "player": "Bob", "seat": 2}
 //! ```
@@ -102,6 +103,12 @@ pub enum ServerToClient {
     GameStateUpdate {
         state: PublicGameState,
     },
+    /// The game closed: every seat passed in a row, so nobody can put a tile.
+    /// Broadcast to all seats right after the terminating `GameStateUpdate`,
+    /// with every player's remaining tiles revealed to everyone.
+    GameClosed {
+        hands: Vec<ClosedHand>,
+    },
     MoveRejected {
         reason: String,
     },
@@ -143,8 +150,9 @@ pub struct PublicRoomState {
 }
 
 /// Full game view broadcast after every accepted move or pass. Opponents'
-/// actual tiles are hidden information and never leave the server; only the
-/// per-seat tile counts are exposed.
+/// actual tiles are hidden information while the game is live — only the
+/// per-seat tile counts are exposed — and they leave the server exactly once:
+/// in the `GameClosed` reveal of a blocked game.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicGameState {
     /// Seat whose turn it is.
@@ -175,6 +183,25 @@ pub fn game_state_view(game: &GameState) -> PublicGameState {
         consecutive_passes: game.passes_in_row() as u8,
         result: game.result(),
     }
+}
+
+/// One seat's remaining tiles, made public when the game closes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosedHand {
+    pub seat: u8,
+    pub hand: Vec<PublicTile>,
+}
+
+/// The reveal broadcast with `GameClosed`: every seat's remaining tiles, in
+/// seat order. Only legitimate once the game is finished (closed); while a
+/// game is live this would leak hidden information.
+pub fn closed_hands_view(game: &GameState) -> Vec<ClosedHand> {
+    (0..SEAT_COUNT)
+        .map(|seat| ClosedHand {
+            seat: seat as u8,
+            hand: game.hand(seat).iter().copied().map(Into::into).collect(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -238,6 +265,26 @@ mod tests {
         assert!(state.board.is_empty());
         assert!(state.left_end.is_none() && state.right_end.is_none());
         assert_eq!(state.consecutive_passes, 0);
+    }
+
+    #[test]
+    fn game_closed_reveals_every_seat_hand_in_seat_order() {
+        let tiles = game::Tile::full_set();
+        let hands = closed_hands_view(&GameState::new(tiles));
+        assert_eq!(hands.len(), SEAT_COUNT);
+        for (seat, entry) in hands.iter().enumerate() {
+            assert_eq!(entry.seat as usize, seat, "the reveal is seat-ordered");
+            assert_eq!(entry.hand.len(), game::HAND_SIZE, "a full hand is seven tiles");
+        }
+    }
+
+    #[test]
+    fn game_closed_message_travels_with_seat_hands() {
+        let msg = ServerToClient::GameClosed {
+            hands: vec![ClosedHand { seat: 2, hand: vec![PublicTile { left: 0, right: 0 }] }],
+        };
+        let json = serde_json::to_string(&msg).expect("serializable");
+        assert_eq!(json, r#"{"type":"GameClosed","hands":[{"seat":2,"hand":[{"left":0,"right":0}]}]}"#);
     }
 
     #[test]

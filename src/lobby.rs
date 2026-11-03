@@ -32,8 +32,8 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::game::{GameState, MoveError, Outcome, Seat, SEAT_COUNT, Side, TableSide, Tile};
 use crate::protocol::{
-    game_state_view, ClientToServer, PublicRoomState, PublicSeat, PublicTile, RoomPhase,
-    ServerToClient,
+    closed_hands_view, game_state_view, ClientToServer, PublicRoomState, PublicSeat, PublicTile,
+    RoomPhase, ServerToClient,
 };
 
 /// A client's connection identity. Issued by [`Lobby::next_player_id`] when
@@ -388,11 +388,19 @@ impl Room {
         let game = inner.game.as_mut().ok_or("no game has been dealt in this room yet")?;
 
         match action(seat, game) {
-            Ok(_) => {
+            Ok(outcome) => {
+                // Build every payload while `game` is borrowed, then fan out.
                 let state = game_state_view(game);
+                // The game closed — nobody can put a tile: prepare the
+                // all-hands reveal that follows the terminating snapshot.
+                let revealed = matches!(outcome, Outcome::Ended(result) if result.is_closed())
+                    .then(|| closed_hands_view(game));
                 // Still holding the room mutex: this update is ordered after
                 // every earlier one and before any later mutation, per client.
                 broadcast(&inner.seats, ServerToClient::GameStateUpdate { state });
+                if let Some(hands) = revealed {
+                    broadcast(&inner.seats, ServerToClient::GameClosed { hands });
+                }
                 Ok(())
             }
             Err(reason) => Err(reason.to_string()),
@@ -464,7 +472,7 @@ impl Default for Lobby {
 mod tests {
     use super::*;
     use crate::game::{EndReason, HAND_SIZE, TILE_COUNT};
-    use crate::protocol::{PublicGameState, Side};
+    use crate::protocol::{ClosedHand, PublicGameState, Side};
     type Event = ServerToClient;
 
     /// Registers `n` fake connections and hands back each one's minted id with
@@ -660,26 +668,37 @@ mod tests {
         })
     }
 
-    /// Pulls the single pending `GameStateUpdate` from every seat's outbox,
-    /// failing on any rejection or stray event. All seats must see equal
-    /// snapshots; returns the one every seat received.
-    fn unanimous_update(seats: &mut [(PlayerId, mpsc::UnboundedReceiver<Event>)]) -> PublicGameState {
-        let mut shared: Option<PublicGameState> = None;
+    /// Pulls the pending `GameStateUpdate` (and any `GameClosed` reveal that
+    /// follows it) from every seat's outbox, failing on any rejection or stray
+    /// event. All seats must see equal snapshots; returns the one every seat
+    /// received together with the closed-game hands, if the command closed it.
+    fn unanimous_update(
+        seats: &mut [(PlayerId, mpsc::UnboundedReceiver<Event>)],
+    ) -> (PublicGameState, Option<Vec<ClosedHand>>) {
+        let mut shared: Option<(PublicGameState, Option<Vec<ClosedHand>>)> = None;
         for (seat, (_, rx)) in seats.iter_mut().enumerate() {
-            let mut pending = Vec::new();
+            let (mut update, mut closed) = (None, None);
             while let Ok(event) = rx.try_recv() {
-                pending.push(event);
+                match event {
+                    Event::GameStateUpdate { state } => {
+                        assert!(update.is_none(), "seat {seat} got two updates for one command");
+                        update = Some(state);
+                    }
+                    Event::GameClosed { hands } => {
+                        assert!(closed.is_none(), "seat {seat} was told of one closing only");
+                        closed = Some(hands);
+                    }
+                    Event::MoveRejected { reason } => panic!("seat {seat} rejected: {reason}"),
+                    other => panic!("seat {seat} saw a stray event mid-game: {other:?}"),
+                }
             }
-            let mut updates = pending.iter().filter_map(|event| match event {
-                Event::GameStateUpdate { state } => Some(state.clone()),
-                Event::MoveRejected { reason } => panic!("seat {seat} rejected: {reason}"),
-                other => panic!("seat {seat} saw a stray event mid-game: {other:?}"),
-            });
-            let first = updates.next().unwrap_or_else(|| panic!("seat {seat} got no update"));
-            assert!(updates.next().is_none(), "seat {seat} got two updates for one command");
+            let update = update.unwrap_or_else(|| panic!("seat {seat} got no update"));
             match &shared {
-                None => shared = Some(first),
-                Some(previous) => assert_eq!(previous, &first, "seats observed divergent snapshots"),
+                None => shared = Some((update, closed)),
+                Some((previous, previous_closed)) => {
+                    assert_eq!(previous, &update, "seats observed divergent snapshots");
+                    assert_eq!(previous_closed, &closed, "seats observed divergent reveals");
+                }
             }
         }
         shared.expect("every seat saw the update")
@@ -757,7 +776,7 @@ mod tests {
                 }
             }
 
-            let next = unanimous_update(&mut seats);
+            let (next, closed) = unanimous_update(&mut seats);
             for seat in 0..SEAT_COUNT {
                 assert_eq!(
                     next.hand_counts[seat],
@@ -779,6 +798,7 @@ mod tests {
                     assert_eq!(next.turn, actor, "the turn freezes when the game ends");
                     match result.reason {
                         EndReason::HandEmpty => {
+                            assert!(closed.is_none(), "a played-out game reveals no hidden hands");
                             assert_eq!(result.winner, Some(actor), "the seat that just emptied its hand wins");
                             assert!(hands[actor].is_empty());
                         }
@@ -795,6 +815,18 @@ mod tests {
                                 if fewest.len() == 1 { Some(fewest[0]) } else { None },
                                 "blocked winner must be the pip-minimum seat index (pips: {pips:?})"
                             );
+                            // A closed game also lands a `GameClosed` reveal on every
+                            // seat: one entry per absolute seat, matching exactly the
+                            // tiles the seats are still holding.
+                            let revealed = closed.expect("a closed game reveals every hand to every seat");
+                            assert_eq!(revealed.len(), SEAT_COUNT);
+                            for (seat, entry) in revealed.iter().enumerate() {
+                                assert_eq!(entry.seat as usize, seat, "reveal rows are seat-ordered");
+                                assert_eq!(
+                                    entry.hand, hands[seat],
+                                    "seat {seat}: the revealed hand must match its hidden hand"
+                                );
+                            }
                         }
                         EndReason::Abandoned => unreachable!("nobody left in this test"),
                     }
@@ -899,6 +931,7 @@ mod tests {
                     }
                     Event::RoomState { room } => roster = Some(room),
                     Event::OpponentDisconnected { .. } => panic!("nobody left during the reseat redeal"),
+                    Event::GameClosed { .. } => panic!("a fresh deal cannot have closed"),
                     Event::MoveRejected { reason } => panic!("rejected during reseat: {reason}"),
                 }
             }
@@ -948,5 +981,74 @@ mod tests {
         assert_eq!(opening.hand_counts, [7, 7, 7, 7]);
         assert!(opening.result.is_none(), "a live game carries no stale result");
         assert!(opening.turn < SEAT_COUNT, "the new opener is an absolute seat");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_game_closes_and_reveals_every_hand_to_all_seats() {
+        let (lobby, mut seats) = fill_table().await;
+        // Replace the randomly dealt game with a deterministic blocked
+        // position: seat 0 opens 6|6 keeping 0|0, the other three seats each
+        // hold one small double. No six survives outside the opening play, so
+        // the whole circle passes and the fourth consecutive pass closes it.
+        let room = lobby.room_for("a").expect("the filled room is registered");
+        {
+            let mut inner = room.inner.lock().await;
+            inner.game = Some(GameState::from_hands([
+                vec![Tile::new(6, 6), Tile::new(0, 0)],
+                vec![Tile::new(1, 1)],
+                vec![Tile::new(2, 2)],
+                vec![Tile::new(3, 3)],
+            ]));
+        }
+        // Drain the deal fan-out so only the closing round is observed.
+        for (_, rx) in seats.iter_mut() {
+            while rx.try_recv().is_ok() {}
+        }
+
+        // Seat 0 (the opener) lays the double six, then everyone is stuck.
+        lobby
+            .handle_event(
+                seats[0].0,
+                ClientToServer::PlayTile { tile: PublicTile { left: 6, right: 6 }, side: Side::Right },
+            )
+            .await;
+        for (_, rx) in seats.iter_mut() {
+            while rx.try_recv().is_ok() {}
+        }
+        // Seats 1..3 pass (three in a row), then seat 0's pass is the fourth.
+        for seat in 1..SEAT_COUNT {
+            lobby.handle_event(seats[seat].0, ClientToServer::PassTurn).await;
+            for (_, rx) in seats.iter_mut() {
+                while rx.try_recv().is_ok() {}
+            }
+        }
+        lobby.handle_event(seats[0].0, ClientToServer::PassTurn).await;
+
+        // Every seat is told the game closed, and the closing carries all four
+        // hands in seat order — no seat is dealt a different reveal than the
+        // others see.
+        let expected = vec![
+            ClosedHand { seat: 0, hand: vec![PublicTile { left: 0, right: 0 }] },
+            ClosedHand { seat: 1, hand: vec![PublicTile { left: 1, right: 1 }] },
+            ClosedHand { seat: 2, hand: vec![PublicTile { left: 2, right: 2 }] },
+            ClosedHand { seat: 3, hand: vec![PublicTile { left: 3, right: 3 }] },
+        ];
+        for (seat, (_, rx)) in seats.iter_mut().enumerate() {
+            let (mut closed_update, mut reveal) = (false, None);
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::GameStateUpdate { state } => {
+                        let result = state.result.expect("the fourth pass ends the game");
+                        assert_eq!(result.reason, EndReason::Blocked);
+                        assert_eq!(result.winner, Some(0), "seat 0 has the fewest pips left (0)");
+                        closed_update = true;
+                    }
+                    Event::GameClosed { hands } => reveal = Some(hands),
+                    other => panic!("seat {seat} saw a stray event on the close: {other:?}"),
+                }
+            }
+            assert!(closed_update, "seat {seat} saw the terminating snapshot");
+            assert_eq!(reveal.expect("seat {seat} was told the game closed"), expected);
+        }
     }
 }

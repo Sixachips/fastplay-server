@@ -220,6 +220,14 @@ pub struct GameResult {
     pub reason: EndReason,
 }
 
+impl GameResult {
+    /// Whether the game closed: it ended blocked, with no seat able to put a
+    /// tile. A closed game reveals every remaining hand to every player.
+    pub fn is_closed(self) -> bool {
+        self.reason == EndReason::Blocked
+    }
+}
+
 /// Why a command was refused by the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -468,7 +476,7 @@ fn starter(hands: &[Vec<Tile>]) -> Seat {
 impl GameState {
     /// Test-only constructor allowing arbitrary (even partial) hands so game
     /// situations can be staged deterministically.
-    fn from_hands(hands: [Vec<Tile>; SEAT_COUNT]) -> Self {
+    pub(crate) fn from_hands(hands: [Vec<Tile>; SEAT_COUNT]) -> Self {
         let turn = starter(&hands);
         Self {
             hands: hands.into(),
