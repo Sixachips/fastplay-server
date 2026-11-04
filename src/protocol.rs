@@ -173,6 +173,10 @@ pub struct PublicGameState {
     pub right_end: Option<u8>,
     /// Tile count per seat (`hand_counts[0]` is seat 0, etc.).
     pub hand_counts: [u8; SEAT_COUNT],
+    /// While the board is empty: the only tile the opener may lay. Set on the
+    /// first hand of a session, where the 6|6 must start the layout; `None`
+    /// for every later hand, which may be opened with any tile.
+    pub opening_tile: Option<PublicTile>,
     /// How many passes were recorded in a row (resets on any play).
     pub consecutive_passes: u8,
     /// Present once the game has ended (winner `None` means a draw or an
@@ -188,6 +192,7 @@ pub fn game_state_view(game: &GameState) -> PublicGameState {
         left_end: game.board().left_end(),
         right_end: game.board().right_end(),
         hand_counts: game.hand_counts().map(|c| c as u8),
+        opening_tile: game.opening_tile().map(Into::into),
         consecutive_passes: game.passes_in_row() as u8,
         result: game.result(),
     }
@@ -271,17 +276,22 @@ mod tests {
     #[test]
     fn game_state_view_hides_opponent_hands() {
         let tiles = game::Tile::full_set();
-        let state = game_state_view(&GameState::new(tiles));
+        let state = game_state_view(&GameState::first_hand(tiles));
         assert_eq!(state.hand_counts, [7, 7, 7, 7]);
         assert!(state.board.is_empty());
         assert!(state.left_end.is_none() && state.right_end.is_none());
         assert_eq!(state.consecutive_passes, 0);
+        assert_eq!(
+            state.opening_tile,
+            Some(PublicTile { left: 6, right: 6 }),
+            "the first hand must be opened with the double six"
+        );
     }
 
     #[test]
     fn game_closed_reveals_every_seat_hand_in_seat_order() {
         let tiles = game::Tile::full_set();
-        let hands = closed_hands_view(&GameState::new(tiles));
+        let hands = closed_hands_view(&GameState::first_hand(tiles));
         assert_eq!(hands.len(), SEAT_COUNT);
         for (seat, entry) in hands.iter().enumerate() {
             assert_eq!(entry.seat as usize, seat, "the reveal is seat-ordered");
@@ -313,8 +323,10 @@ mod tests {
         tiles.extend(hand7(&[(2, 3), (2, 4), (2, 5), (2, 6), (3, 3), (3, 4), (3, 5)]));
         tiles.extend(hand7(&[(0, 0), (3, 6), (4, 4), (4, 5), (4, 6), (5, 5), (5, 6)]));
         assert_eq!(tiles.len(), game::TILE_COUNT);
-        let mut game = GameState::new(tiles);
-        assert_eq!(game_state_view(&game).turn, 0, "seat 0 holds 6|6");
+        let mut game = GameState::first_hand(tiles);
+        let opening = game_state_view(&game);
+        assert_eq!(opening.turn, 0, "seat 0 holds 6|6");
+        assert_eq!(opening.opening_tile, Some(PublicTile { left: 6, right: 6 }));
 
         game.play(0, game::Tile::new(6, 6), game::Side::Right).expect("opens");
         let view = game_state_view(&game);
@@ -322,6 +334,7 @@ mod tests {
         assert_eq!(view.hand_counts, [6, 7, 7, 7], "only seat 0 lost a tile");
         assert_eq!((view.left_end, view.right_end), (Some(6), Some(6)));
         assert_eq!(view.board.len(), 1);
+        assert_eq!(view.opening_tile, None, "the forced opening is spent");
     }
 
     #[test]

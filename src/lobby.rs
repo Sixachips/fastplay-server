@@ -312,11 +312,15 @@ impl Room {
         let Some(seat) = inner.seats.iter().position(Option::is_none) else {
             return Err(format!("room {:?} already has all four seats taken", self.code));
         };
+        // The seat ring walks counter-clockwise (rules.md): each seat hands the
+        // turn to the player on its right-hand neighbour, so seat 1 is the WEST
+        // seat of a North-facing-south table, not its East — North(0) passes to
+        // West(1), West to South(2), South to East(3), East back to North.
         let table_side = match seat {
             0 => TableSide::North,
-            1 => TableSide::East,
+            1 => TableSide::West,
             2 => TableSide::South,
-            3 => TableSide::West,
+            3 => TableSide::East,
             _ => unreachable!(),
         };
         inner.seats[seat] = Some(Occupant {
@@ -442,10 +446,29 @@ impl Room {
 /// which has never had one). Hands go straight into their owners' outboxes;
 /// the opening snapshot fans out to everyone. Every readiness flag starts the
 /// next rematch clock over.
+///
+/// Opening policy (`Rules.md`):
+/// * The first hand of a session is opened by the holder of the **6|6**, who
+///   must lay it down (the engine enforces that as the forced opening tile).
+/// * Every later hand is opened by the previous hand's winner — a blocked hand
+///   is won by the fewest-pips seat. If the previous hand had no winner (a
+///   blocked tie, or a game voided by a departure), the open rotates one seat
+///   counter-clockwise from the previous opener.
 fn deal_fresh_game(inner: &mut RoomInner) {
     let mut tiles = Tile::full_set();
     tiles.shuffle(&mut thread_rng());
-    let game = GameState::new(tiles);
+
+    let previous = inner.game.as_ref().map(|game| (game.result(), game.opener()));
+    let game = match previous {
+        // No hand has been played in this room yet.
+        None => GameState::first_hand(tiles),
+        Some((Some(result), opener)) => GameState::new(
+            tiles,
+            result.winner.unwrap_or((opener + 1) % SEAT_COUNT),
+        ),
+        // Defensive: an unfinished game is never replaced in place.
+        Some((None, opener)) => GameState::new(tiles, (opener + 1) % SEAT_COUNT),
+    };
 
     for occupant in inner.seats.iter_mut() {
         if let Some(occupant) = occupant.as_mut() {
@@ -527,7 +550,7 @@ impl Default for Lobby {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::{EndReason, HAND_SIZE, TILE_COUNT};
+    use crate::game::{EndReason, GameResult, HAND_SIZE, TILE_COUNT};
     use crate::protocol::{ClosedHand, PublicGameState, Side};
     type Event = ServerToClient;
 
@@ -706,12 +729,16 @@ mod tests {
     }
 
     /// First `(tile, side)` placement fitting the public ends, mirroring what
-    /// a client's legality layer computes from its own hand. `None` means the
-    /// seat must pass — a mismatch here is a bug if the engine disagrees.
-    fn first_legal(hand: &[PublicTile], left_end: Option<u8>, right_end: Option<u8>) -> Option<(PublicTile, Side)> {
-        let (left, right) = match (left_end, right_end) {
-            (Some(l), Some(r)) => (l, r),
-            _ => return hand.first().copied().map(|tile| (tile, Side::Right)), // empty board: any tile
+    /// a client's legality layer computes from its own hand and the forced
+    /// opening tile. `None` means the seat must pass — a mismatch here is a
+    /// bug if the engine disagrees.
+    fn first_legal(hand: &[PublicTile], state: &PublicGameState) -> Option<(PublicTile, Side)> {
+        let (Some(left), Some(right)) = (state.left_end, state.right_end) else {
+            // Empty board: only the forced opening tile may be laid, if any.
+            return match state.opening_tile {
+                Some(opening) => Some((opening, Side::Right)),
+                None => hand.first().copied().map(|tile| (tile, Side::Right)),
+            };
         };
         hand.iter().find_map(|&tile| {
             if tile.left == left || tile.right == left {
@@ -784,6 +811,17 @@ mod tests {
         let mut state = state.expect("opening snapshot");
         assert_eq!(state.hand_counts, [7, 7, 7, 7]);
         assert!(state.result.is_none());
+        // The first hand of the session: the 6|6 holder opens, and the 6|6 is
+        // the only tile that can be laid.
+        assert_eq!(
+            state.opening_tile,
+            Some(PublicTile { left: 6, right: 6 }),
+            "the first hand is opened by the double six"
+        );
+        assert!(
+            hands[state.turn].contains(&PublicTile { left: 6, right: 6 }),
+            "the opener holds the 6|6"
+        );
 
         let mut pass_run = 0usize;
         let mut rejected_off_turn = false;
@@ -816,7 +854,7 @@ mod tests {
                 assert!(saw_rejection);
             }
 
-            match first_legal(&hands[actor], state.left_end, state.right_end) {
+            match first_legal(&hands[actor], &state) {
                 Some((tile, side)) => {
                     lobby.handle_event(seats[actor].0, ClientToServer::PlayTile { tile, side }).await;
                     let before = hands[actor].len();
@@ -1028,9 +1066,9 @@ mod tests {
             assert_eq!(public.player_id, expected, "seat {} kept its identity across the reseat", public.seat);
             let expected_side = match public.seat as usize {
                 0 => TableSide::North,
-                1 => TableSide::East,
+                1 => TableSide::West,
                 2 => TableSide::South,
-                _ => TableSide::West,
+                _ => TableSide::East,
             };
             assert_eq!(public.table_side, expected_side, "table sides are pinned to seats, not occupants");
         }
@@ -1192,5 +1230,162 @@ mod tests {
                 roster.seats.iter().map(|s| (s.seat, s.player_id)).collect();
             assert_eq!(listed, expected_seats, "an in-place rematch never moves a seat");
         }
+    }
+
+    /// Drains the deal fan-out and returns the shared opening snapshot plus
+    /// every seat's private hand, exactly as the seats saw them.
+    fn opening_of(
+        seats: &mut [(PlayerId, mpsc::UnboundedReceiver<Event>)],
+    ) -> (PublicGameState, [Vec<PublicTile>; SEAT_COUNT]) {
+        let mut hands: [Vec<PublicTile>; SEAT_COUNT] = std::array::from_fn(|_| Vec::new());
+        let mut state = None;
+        for (_, rx) in seats.iter_mut() {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::HandDealt { seat, hand } => hands[seat as usize] = hand,
+                    Event::GameStateUpdate { state: snapshot } => state = Some(snapshot),
+                    Event::RoomState { .. } => {}
+                    other => panic!("unexpected opening event: {other:?}"),
+                }
+            }
+        }
+        (state.expect("an opening snapshot"), hands)
+    }
+
+    #[tokio::test]
+    async fn the_first_hand_is_opened_by_the_double_six_and_nothing_else() {
+        let (lobby, mut seats) = fill_table().await;
+        let (opening, hands) = opening_of(&mut seats);
+
+        let double_six = PublicTile { left: 6, right: 6 };
+        assert_eq!(opening.opening_tile, Some(double_six));
+        let opener = opening.turn;
+        assert!(hands[opener].contains(&double_six), "the 6|6 holder opens the session");
+
+        // Any other tile is refused outright — even though every tile would
+        // fit an empty board.
+        let other = *hands[opener].iter().find(|&&tile| tile != double_six).expect("six more tiles");
+        lobby
+            .handle_event(seats[opener].0, ClientToServer::PlayTile { tile: other, side: Side::Right })
+            .await;
+        assert!(
+            matches!(seats[opener].1.try_recv(), Ok(Event::MoveRejected { reason }) if reason.contains("6|6")),
+            "the opener is told the 6|6 must start the layout"
+        );
+
+        // The double six itself goes down and the forced opening is spent.
+        lobby
+            .handle_event(seats[opener].0, ClientToServer::PlayTile { tile: double_six, side: Side::Right })
+            .await;
+        let (played, _) = unanimous_update(&mut seats);
+        assert_eq!(played.opening_tile, None);
+        assert_eq!(played.board.len(), 1);
+        assert_eq!(played.turn, (opener + 1) % SEAT_COUNT);
+    }
+
+    #[tokio::test]
+    async fn a_rematch_is_opened_by_the_previous_hand_winner() {
+        let (lobby, mut seats) = fill_table().await;
+        for (_, rx) in seats.iter_mut() {
+            while rx.try_recv().is_ok() {}
+        }
+
+        // Seat 2 plays out with the 6|6 and wins the hand by dominoing.
+        let mut finished = GameState::from_hands([
+            vec![Tile::new(0, 1)],
+            vec![Tile::new(1, 2)],
+            vec![Tile::new(6, 6)],
+            vec![Tile::new(3, 4)],
+        ]);
+        assert_eq!(finished.turn(), 2);
+        finished.play(2, Tile::new(6, 6), crate::game::Side::Right).expect("plays out");
+        assert_eq!(finished.result().and_then(|result| result.winner), Some(2));
+        let room = lobby.room_for("a").expect("filled room");
+        room.inner.lock().await.game = Some(finished);
+
+        for (id, _) in seats.iter() {
+            lobby.handle_event(*id, ClientToServer::PlayAgain).await;
+        }
+
+        let inner = room.inner.lock().await;
+        let game = inner.game.as_ref().expect("the rematch dealt a fresh hand");
+        assert_eq!(game.turn(), 2, "the previous winner opens the next hand");
+        assert_eq!(game.opener(), 2);
+        assert_eq!(game.opening_tile(), None, "later hands open with any tile");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_rematch_is_opened_by_the_fewest_pips_seat() {
+        let (lobby, mut seats) = fill_table().await;
+        for (_, rx) in seats.iter_mut() {
+            while rx.try_recv().is_ok() {}
+        }
+
+        // Seat 1 opens the 6|6 and keeps 1|2; seat 0 keeps 0|0 (0 pips) and
+        // seals the block. The pip-minimum seat wins and takes the next open.
+        let mut finished = GameState::from_hands([
+            vec![Tile::new(0, 0)],
+            vec![Tile::new(6, 6), Tile::new(1, 2)],
+            vec![Tile::new(2, 2)],
+            vec![Tile::new(3, 3)],
+        ]);
+        assert_eq!(finished.turn(), 1, "6|6 is the highest double");
+        finished.play(1, Tile::new(6, 6), crate::game::Side::Right).expect("opens");
+        for seat in [2, 3, 0, 1] {
+            finished.pass(seat).expect("no six outside the opening double");
+        }
+        assert_eq!(
+            finished.result(),
+            Some(GameResult { winner: Some(0), reason: EndReason::Blocked })
+        );
+        let room = lobby.room_for("a").expect("filled room");
+        room.inner.lock().await.game = Some(finished);
+
+        for (id, _) in seats.iter() {
+            lobby.handle_event(*id, ClientToServer::PlayAgain).await;
+        }
+
+        let inner = room.inner.lock().await;
+        let game = inner.game.as_ref().expect("the rematch dealt a fresh hand");
+        assert_eq!(game.turn(), 0, "the fewest-pips seat takes the next opening turn");
+        assert_eq!(game.opening_tile(), None);
+    }
+
+    #[tokio::test]
+    async fn a_tied_blocked_rematch_rotates_the_open_counter_clockwise() {
+        let (lobby, mut seats) = fill_table().await;
+        for (_, rx) in seats.iter_mut() {
+            while rx.try_recv().is_ok() {}
+        }
+
+        // Seat 2 opens the 6|6 and keeps 0|4; seats 0 and 1 tie on 3 pips, so
+        // the blocked hand has no winner and the open rotates from seat 2.
+        let mut finished = GameState::from_hands([
+            vec![Tile::new(1, 2)],
+            vec![Tile::new(0, 3)],
+            vec![Tile::new(6, 6), Tile::new(0, 4)],
+            vec![Tile::new(5, 5)],
+        ]);
+        assert_eq!(finished.turn(), 2, "6|6 is the highest double");
+        finished.play(2, Tile::new(6, 6), crate::game::Side::Right).expect("opens");
+        for seat in [3, 0, 1, 2] {
+            finished.pass(seat).expect("no six outside the opening double");
+        }
+        assert_eq!(
+            finished.result(),
+            Some(GameResult { winner: None, reason: EndReason::Blocked }),
+            "equal pips at seats 0 and 1 make the blocked hand a draw"
+        );
+        let room = lobby.room_for("a").expect("filled room");
+        room.inner.lock().await.game = Some(finished);
+
+        for (id, _) in seats.iter() {
+            lobby.handle_event(*id, ClientToServer::PlayAgain).await;
+        }
+
+        let inner = room.inner.lock().await;
+        let game = inner.game.as_ref().expect("the rematch dealt a fresh hand");
+        assert_eq!(game.turn(), 3, "a draw rotates the open one seat counter-clockwise");
+        assert_eq!(game.opening_tile(), None);
     }
 }

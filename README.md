@@ -37,7 +37,7 @@ The server is **purely authoritative** — game state never leaves the server, a
 The server implements a double-six (28-tile) dominoes game for exactly 4 players:
 
 - **Setup:** Each player is dealt 7 tiles from the shuffled double-six set.
-- **Opening:** The seat holding the highest double opens the game. If no one holds a double, the seat with the highest-pip tile opens (seat order breaks ties).
+- **Opening:** The first hand of a session is opened by the seat holding the 6–6, which must lay that tile down. Every later hand (a rematch, or a redeal after a seat change) is opened by the previous hand's winner — the fewest-pips seat after a blocked hand — who may open with any tile. A blocked hand with tied pips has no winner, so the open rotates one seat counter-clockwise from the previous opener.
 - **Play:** Players take turns placing one tile on either end of the linear board. A tile must match the pips on the end it's played against.
 - **Passing:** If a player has no legal play, they must pass. Four consecutive passes (from all seats) block the game.
 - **Ending:** The game ends when:
@@ -77,6 +77,7 @@ Fields visible to all seats:
 - `board` — played tiles, left-to-right, physically oriented
 - `left_end` / `right_end` — pips at the outer ends of the board (or `null`)
 - `hand_counts` — number of tiles remaining per seat (opponents' hands are hidden)
+- `opening_tile` — while the board is empty, the only tile the opener may lay (the 6–6 on a session's first hand; `null` on later hands)
 - `consecutive_passes` — how many passes have been recorded in a row
 - `result` — present once the game has ended (`winner` may be `None` for a draw or abandoned game)
 

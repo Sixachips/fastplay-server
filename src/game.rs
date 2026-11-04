@@ -10,8 +10,11 @@
 //!   empty, so passing is the only alternative to playing).
 //! * A single linear board ("the train") with a left and a right end. The
 //!   first tile played sets both ends and the requested side is ignored.
-//! * The seat holding the highest double opens the game; if nobody holds a
-//!   double, the seat with the highest-pip tile opens (seat order breaks ties).
+//! * The first hand of a session is opened by the seat holding the 6|6, which
+//!   must lay that tile down to start the layout. Every later hand is opened
+//!   by the previous hand's winner (the fewest-pips seat of a blocked hand,
+//!   or the next seat counter-clockwise when a blocked hand is tied), who may
+//!   open with any tile of their choice.
 //! * A seat that cannot play must pass. Once every seat has passed in a row
 //!   the game is blocked and the seat with the fewest pips in hand wins
 //!   (a tie is a draw).
@@ -240,6 +243,9 @@ pub enum MoveError {
     TileNotInHand,
     /// The tile does not match the requested end of the board.
     TileDoesNotFit,
+    /// The board is empty and this hand must be opened with its forced tile
+    /// (the 6|6 on the first hand of a session).
+    WrongOpeningTile,
     /// The seat has at least one legal placement and therefore cannot pass.
     IllegalPass,
 }
@@ -252,6 +258,7 @@ impl fmt::Display for MoveError {
             MoveError::NotYourTurn => "it is not your turn",
             MoveError::TileNotInHand => "you do not hold that tile",
             MoveError::TileDoesNotFit => "that tile does not fit the requested end",
+            MoveError::WrongOpeningTile => "this hand must be opened with the 6|6 tile",
             MoveError::IllegalPass => "you have a legal move and cannot pass",
         })
     }
@@ -272,28 +279,60 @@ pub struct GameState {
     hands: Vec<Vec<Tile>>,
     board: Board,
     turn: Seat,
+    /// Seat that took the opening turn of this hand.
+    opener: Seat,
+    /// While the board is empty, the only tile the opener may lay. `Some` on
+    /// the first hand of a session (the 6|6 must start the layout); `None`
+    /// for every later hand, which opens with any tile.
+    opening_tile: Option<Tile>,
     passes_in_row: usize,
     result: Option<GameResult>,
 }
 
 impl GameState {
-    /// Builds a game from a full, shuffled 28-tile set. The tiles are dealt
-    /// seat by seat in seat order (7 per seat); the opening seat is chosen per
-    /// the rules in the module docs. Each hand is sorted afterwards so the
-    /// client display order is deterministic.
-    pub fn new(tiles: Vec<Tile>) -> Self {
-        assert!(tiles.len() == TILE_COUNT, "a double-six game starts from exactly {TILE_COUNT} tiles");
-        let mut hands: Vec<Vec<Tile>> = (0..SEAT_COUNT)
-            .map(|seat| tiles[seat * HAND_SIZE..(seat + 1) * HAND_SIZE].to_vec())
-            .collect();
-        for hand in &mut hands {
-            hand.sort_by_key(|t| (t.a, t.b));
+    /// Deals a full double-six set to the four seats. `opener` takes the first
+    /// turn and may open with any tile of its choice: the rule for every hand
+    /// after the first of a session.
+    ///
+    /// # Panics
+    /// If `tiles` is not a full 28-tile set or `opener` is not a seat.
+    pub fn new(tiles: Vec<Tile>, opener: Seat) -> Self {
+        Self::deal(tiles, opener, None)
+    }
+
+    /// Deals the first hand of a session: the seat holding the **Double-Six**
+    /// opens, and must lay that tile down to start the layout.
+    ///
+    /// # Panics
+    /// If `tiles` is not a full 28-tile set (which always contains the 6|6).
+    pub fn first_hand(tiles: Vec<Tile>) -> Self {
+        let hands = dealt_hands(&tiles);
+        let double_six = Tile::new(MAX_PIP, MAX_PIP);
+        let opener = hands
+            .iter()
+            .position(|hand| hand.contains(&double_six))
+            .expect("a full double-six set always contains the 6|6");
+        Self::with_hands(hands, opener, Some(double_six))
+    }
+
+    fn deal(tiles: Vec<Tile>, opener: Seat, opening_tile: Option<Tile>) -> Self {
+        Self::with_hands(dealt_hands(&tiles), opener, opening_tile)
+    }
+
+    fn with_hands(hands: Vec<Vec<Tile>>, opener: Seat, opening_tile: Option<Tile>) -> Self {
+        assert!(opener < SEAT_COUNT, "the opener must be a seat at the table");
+        if let Some(tile) = opening_tile {
+            assert!(
+                hands[opener].contains(&tile),
+                "the forced opening tile must be in the opener's hand"
+            );
         }
-        let turn = starter(&hands);
         Self {
             hands,
             board: Board::default(),
-            turn,
+            turn: opener,
+            opener,
+            opening_tile,
             passes_in_row: 0,
             result: None,
         }
@@ -302,6 +341,17 @@ impl GameState {
     /// Seat whose turn it currently is.
     pub fn turn(&self) -> Seat {
         self.turn
+    }
+
+    /// Seat that took the opening turn of this hand.
+    pub fn opener(&self) -> Seat {
+        self.opener
+    }
+
+    /// The forced opening tile while the board is still empty (only on the
+    /// first hand of a session), otherwise `None`.
+    pub fn opening_tile(&self) -> Option<Tile> {
+        self.opening_tile
     }
 
     pub fn board(&self) -> &Board {
@@ -344,13 +394,20 @@ impl GameState {
     }
 
     /// Every legal `(tile, side)` placement for `seat`. On an empty board every
-    /// tile is legal and `Side::Right` is reported (the side is ignored there).
+    /// tile is legal and `Side::Right` is reported (the side is ignored there) —
+    /// except on a forced opening, where only the required tile is legal.
     pub fn legal_moves(&self, seat: Seat) -> Vec<(Tile, Side)> {
         if self.is_finished() {
             return Vec::new();
         }
         if self.board.is_empty() {
-            return self.hands[seat].iter().copied().map(|t| (t, Side::Right)).collect();
+            return match self.opening_tile {
+                Some(required) if self.hands[seat].contains(&required) => {
+                    vec![(required, Side::Right)]
+                }
+                Some(_) => Vec::new(),
+                None => self.hands[seat].iter().copied().map(|t| (t, Side::Right)).collect(),
+            };
         }
         let (left, right) = self.board.ends().expect("non-empty board has both ends");
         self.hands[seat]
@@ -389,10 +446,20 @@ impl GameState {
             Some(pos) => pos,
             None => return Err(MoveError::TileNotInHand),
         };
+        let opening_move = self.board.is_empty();
+        if let Some(required) = self.opening_tile {
+            if opening_move && tile != required {
+                return Err(MoveError::WrongOpeningTile);
+            }
+        }
         self.board
             .play(side, tile)
             .ok_or(MoveError::TileDoesNotFit)?;
         self.hands[seat].remove(pos);
+        if opening_move {
+            // The forced opening tile has been laid; the hand is open.
+            self.opening_tile = None;
+        }
         self.passes_in_row = 0;
         if self.hands[seat].is_empty() {
             let result = GameResult { winner: Some(seat), reason: EndReason::HandEmpty };
@@ -452,8 +519,22 @@ impl GameState {
     }
 }
 
-/// The seat opening the game: holder of the highest double, else of the
-/// highest-pip tile. Seat order breaks ties deterministically.
+/// Splits a full 28-tile set into four sorted seven-tile hands, seat order.
+fn dealt_hands(tiles: &[Tile]) -> Vec<Vec<Tile>> {
+    assert!(tiles.len() == TILE_COUNT, "a double-six game starts from exactly {TILE_COUNT} tiles");
+    let mut hands: Vec<Vec<Tile>> = (0..SEAT_COUNT)
+        .map(|seat| tiles[seat * HAND_SIZE..(seat + 1) * HAND_SIZE].to_vec())
+        .collect();
+    for hand in &mut hands {
+        hand.sort_by_key(|t| (t.a, t.b));
+    }
+    hands
+}
+
+/// Test-only opener picker: the holder of the highest double, else of the
+/// highest-pip tile, with seat order breaking ties. Production openers are
+/// chosen by the room layer (`lobby::deal_fresh_game`), not by the engine.
+#[cfg(test)]
 fn starter(hands: &[Vec<Tile>]) -> Seat {
     let mut best: Option<(Seat, Tile)> = None;
     for (seat, hand) in hands.iter().enumerate() {
@@ -482,6 +563,8 @@ impl GameState {
             hands: hands.into(),
             board: Board::default(),
             turn,
+            opener: turn,
+            opening_tile: None,
             passes_in_row: 0,
             result: None,
         }
@@ -506,21 +589,52 @@ mod tests {
     }
 
     #[test]
-    fn double_six_deal_produces_four_full_hands_and_starter() {
+    fn first_hand_deals_four_full_hands_and_forces_the_double_six() {
         let mut tiles = Tile::full_set();
         tiles.shuffle(&mut rand::thread_rng());
-        let game = GameState::new(tiles);
+        let game = GameState::first_hand(tiles);
         let counts = game.hand_counts();
         assert!(counts.iter().all(|&c| c == HAND_SIZE));
         assert_eq!(counts.iter().sum::<usize>(), TILE_COUNT);
-        assert_eq!(game.turn(), starter_sanity(&game));
+        // The 6|6 holder opens, and the 6|6 is the only tile that may be laid.
+        let double_six = Tile::new(6, 6);
+        assert_eq!(game.opening_tile(), Some(double_six));
+        assert_eq!(game.opener(), game.turn());
+        assert!(game.hand(game.turn()).contains(&double_six), "the 6|6 holder opens");
+        assert_eq!(game.legal_moves(game.turn()), vec![(double_six, Side::Right)]);
         assert!(!game.is_finished());
     }
 
-    // Re-derives the starter from the dealt hands to cross-check `new()`.
-    fn starter_sanity(game: &GameState) -> Seat {
-        let hands: Vec<Vec<Tile>> = (0..SEAT_COUNT).map(|s| game.hand(s).to_vec()).collect();
-        starter(&hands)
+    #[test]
+    fn later_hands_open_with_any_tile_at_the_named_seat() {
+        // Every hand after the first: the room names the opener (the previous
+        // hand's winner) and there is no forced opening tile.
+        let mut tiles = Tile::full_set();
+        tiles.shuffle(&mut rand::thread_rng());
+        let game = GameState::new(tiles, 2);
+        assert_eq!(game.turn(), 2);
+        assert_eq!(game.opener(), 2);
+        assert_eq!(game.opening_tile(), None);
+        assert_eq!(game.legal_moves(2).len(), HAND_SIZE, "any held tile may open");
+    }
+
+    #[test]
+    fn forced_opening_rejects_other_tiles_until_the_double_six_lands() {
+        // `full_set()` deals seat 3 the tiles at indices 21..28, which include
+        // the last-built 6|6; seat 3 therefore opens the first hand.
+        let mut game = GameState::first_hand(Tile::full_set());
+        assert_eq!(game.turn(), 3);
+        let other = game.hand(3)[0];
+        assert_ne!(other, Tile::new(6, 6));
+        assert_eq!(
+            game.play(3, other, Side::Right),
+            Err(MoveError::WrongOpeningTile),
+            "only the 6|6 may start the first hand"
+        );
+        assert_eq!(game.play(3, Tile::new(6, 6), Side::Right), Ok(Outcome::Continued));
+        assert_eq!(game.opening_tile(), None, "the restriction lifts after the opening move");
+        assert_eq!(game.turn(), 0, "the turn still walks one seat from the opener");
+        assert_eq!(game.board().ends(), Some((6, 6)));
     }
 
     #[test]
@@ -769,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn starter_is_deterministic_doubles_beat_pips_and_low_seat_breaks_ties() {
+    fn staged_hands_break_starter_ties_deterministically() {
         // Equal-pip non-doubles: the lower seat opens, no matter which side
         // of the tie the tiles sit on.
         let a = GameState::from_hands([
@@ -786,7 +900,7 @@ mod tests {
             vec![Tile::new(1, 6)],
         ]);
         assert_eq!(b.turn(), 0);
-        // Any double outranks a higher-pip non-double, per the module rules.
+        // Any double outranks a higher-pip non-double, per the staged helper.
         let c = GameState::from_hands([
             vec![Tile::new(6, 5)],
             vec![],
@@ -794,14 +908,20 @@ mod tests {
             vec![],
         ]);
         assert_eq!(c.turn(), 2);
-        // The same deck dealt twice opens the same way.
+        // The same deck dealt twice opens the first hand the same way.
         let mut deck = Tile::full_set();
         deck.shuffle(&mut rand::thread_rng());
-        assert_eq!(GameState::new(deck.clone()).turn(), GameState::new(deck).turn());
+        let first = GameState::first_hand(deck.clone());
+        assert_eq!(first.opener(), first.turn());
+        assert!(first.hand(first.turn()).contains(&Tile::new(6, 6)));
+        assert_eq!(GameState::first_hand(deck).turn(), first.turn());
     }
 
     #[test]
-    fn every_step_walks_the_turn_exactly_one_seat_clockwise() {
+    fn every_step_walks_the_turn_exactly_one_seat_counter_clockwise() {
+        // With the lobby's seat→position mapping (0=North, 1=West, 2=South,
+        // 3=East) the +1 seat walk is a counter-clockwise lap of the table:
+        // every seat hands the turn to its right-hand neighbour.
         // Scripted full cycle: seat 0 opens 6|6; every hand is six-blind
         // except seat 3's 5|6 (one extra placement). The turn must walk
         // 0→1→2→3→0→1→2→3 with no seat skipped or revisited, ending blocked
