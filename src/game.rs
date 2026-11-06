@@ -435,49 +435,72 @@ impl GameState {
     /// Plays `tile` of `seat` at `side`. The tile is matched against the
     /// unordered pip pair, so any orientation the client sends is accepted.
     pub fn play(&mut self, seat: Seat, tile: Tile, side: Side) -> Result<Outcome, MoveError> {
-        if self.is_finished() {
-            return Err(MoveError::GameNotActive);
-        }
-        if self.turn != seat {
-            return Err(MoveError::NotYourTurn);
-        }
+        // Validate first: every guard rejects before any state is touched.
+        self.ensure_active_turn(seat)?;
         let tile = tile.normalized();
-        let pos = match self.hands[seat].iter().position(|&t| t == tile) {
-            Some(pos) => pos,
-            None => return Err(MoveError::TileNotInHand),
-        };
+        let held = self.held_index(seat, tile)?;
         let opening_move = self.board.is_empty();
-        if let Some(required) = self.opening_tile {
-            if opening_move && tile != required {
-                return Err(MoveError::WrongOpeningTile);
-            }
-        }
-        self.board
-            .play(side, tile)
-            .ok_or(MoveError::TileDoesNotFit)?;
-        self.hands[seat].remove(pos);
+        self.ensure_opening_tile(tile, opening_move)?;
+
+        // Commit the move.
+        self.board.play(side, tile).ok_or(MoveError::TileDoesNotFit)?;
+        self.hands[seat].remove(held);
         if opening_move {
             // The forced opening tile has been laid; the hand is open.
             self.opening_tile = None;
         }
         self.passes_in_row = 0;
+
+        // Resolve the outcome: an emptied hand wins immediately, otherwise
+        // play passes to the next seat.
         if self.hands[seat].is_empty() {
             let result = GameResult { winner: Some(seat), reason: EndReason::HandEmpty };
-            self.result = Some(result);
-            return Ok(Outcome::Ended(result));
+            return Ok(self.end_with(result));
         }
         self.turn = (self.turn + 1) % SEAT_COUNT;
         Ok(Outcome::Continued)
     }
 
-    /// Records a pass for `seat`. Only legal when the seat has no placement.
-    pub fn pass(&mut self, seat: Seat) -> Result<Outcome, MoveError> {
+    /// Precondition of every commanding seat: the game must still be live
+    /// and it must be `seat`'s turn.
+    fn ensure_active_turn(&self, seat: Seat) -> Result<(), MoveError> {
         if self.is_finished() {
             return Err(MoveError::GameNotActive);
         }
         if self.turn != seat {
             return Err(MoveError::NotYourTurn);
         }
+        Ok(())
+    }
+
+    /// Index of `tile` in `seat`'s hand, or an error when the seat does not
+    /// hold it.
+    fn held_index(&self, seat: Seat, tile: Tile) -> Result<usize, MoveError> {
+        self.hands[seat]
+            .iter()
+            .position(|&t| t == tile)
+            .ok_or(MoveError::TileNotInHand)
+    }
+
+    /// While the board is empty under a forced opening tile, no other tile
+    /// may open the hand.
+    fn ensure_opening_tile(&self, tile: Tile, opening_move: bool) -> Result<(), MoveError> {
+        if opening_move && self.opening_tile.is_some_and(|required| tile != required) {
+            return Err(MoveError::WrongOpeningTile);
+        }
+        Ok(())
+    }
+
+    /// Stamp of a finished game: stores the result — the single place
+    /// `self.result` is written — and reports the end.
+    fn end_with(&mut self, result: GameResult) -> Outcome {
+        self.result = Some(result);
+        Outcome::Ended(result)
+    }
+
+    /// Records a pass for `seat`. Only legal when the seat has no placement.
+    pub fn pass(&mut self, seat: Seat) -> Result<Outcome, MoveError> {
+        self.ensure_active_turn(seat)?;
         if !self.legal_moves(seat).is_empty() {
             return Err(MoveError::IllegalPass);
         }
@@ -492,8 +515,7 @@ impl GameState {
                 None
             };
             let result = GameResult { winner, reason: EndReason::Blocked };
-            self.result = Some(result);
-            return Ok(Outcome::Ended(result));
+            return Ok(self.end_with(result));
         }
         self.turn = (self.turn + 1) % SEAT_COUNT;
         Ok(Outcome::Continued)
@@ -503,9 +525,7 @@ impl GameState {
     /// already ended stays untouched; the caller can confirm with
     /// [`GameState::is_finished`].
     pub fn abandon(&mut self) -> Outcome {
-        let result = GameResult { winner: None, reason: EndReason::Abandoned };
-        self.result = Some(result);
-        Outcome::Ended(result)
+        self.end_with(GameResult { winner: None, reason: EndReason::Abandoned })
     }
 
     /// Like [`GameState::abandon`], but only when the game is still live.
