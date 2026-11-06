@@ -32,8 +32,8 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::game::{GameState, MoveError, Outcome, Seat, SEAT_COUNT, Side, TableSide, Tile};
 use crate::protocol::{
-    closed_hands_view, game_state_view, ClientToServer, PublicRoomState, PublicSeat, PublicTile,
-    RoomPhase, ServerToClient,
+    closed_hands_view, game_state_view, ClientToServer, PublicRoomState, PublicSeat, RoomPhase,
+    ServerToClient,
 };
 
 /// A client's connection identity. Issued by [`Lobby::next_player_id`] when
@@ -444,46 +444,64 @@ impl Room {
 
 /// Deals a fresh game to a full table whose current game is finished (or
 /// which has never had one). Hands go straight into their owners' outboxes;
-/// the opening snapshot fans out to everyone. Every readiness flag starts the
-/// next rematch clock over.
-///
-/// Opening policy (`Rules.md`):
-/// * The first hand of a session is opened by the holder of the **6|6**, who
-///   must lay it down (the engine enforces that as the forced opening tile).
-/// * Every later hand is opened by the previous hand's winner — a blocked hand
-///   is won by the fewest-pips seat. If the previous hand had no winner (a
-///   blocked tie, or a game voided by a departure), the open rotates one seat
-///   counter-clockwise from the previous opener.
+/// the opening snapshot fans out to everyone afterwards.
 fn deal_fresh_game(inner: &mut RoomInner) {
-    let mut tiles = Tile::full_set();
-    tiles.shuffle(&mut thread_rng());
+    let game = fresh_game(inner.game.as_ref());
 
-    let previous = inner.game.as_ref().map(|game| (game.result(), game.opener()));
-    let game = match previous {
-        // No hand has been played in this room yet.
-        None => GameState::first_hand(tiles),
-        Some((Some(result), opener)) => GameState::new(
-            tiles,
-            result.winner.unwrap_or((opener + 1) % SEAT_COUNT),
-        ),
-        // Defensive: an unfinished game is never replaced in place.
-        Some((None, opener)) => GameState::new(tiles, (opener + 1) % SEAT_COUNT),
-    };
+    clear_readiness(&mut inner.seats);
+    deal_private_hands(&mut inner.seats, &game);
 
-    for occupant in inner.seats.iter_mut() {
-        if let Some(occupant) = occupant.as_mut() {
-            occupant.ready = false;
-        }
-    }
-    // Hands first, strictly into their owners' outboxes.
-    for (seat, occupant) in inner.seats.iter_mut().enumerate() {
-        let occupant = occupant.as_mut().expect("table is full");
-        let hand: Vec<PublicTile> = game.hand(seat).iter().copied().map(Into::into).collect();
-        let _ = occupant.outbox.send(ServerToClient::HandDealt { seat: seat as u8, hand });
-    }
     let opening = game_state_view(&game);
     inner.game = Some(game);
     broadcast(&inner.seats, ServerToClient::GameStateUpdate { state: opening });
+}
+
+/// Builds the next game from a freshly shuffled double-six set, opening per
+/// the session's opening policy (see [`next_opener`]).
+fn fresh_game(previous: Option<&GameState>) -> GameState {
+    let mut tiles = Tile::full_set();
+    tiles.shuffle(&mut thread_rng());
+    match next_opener(previous) {
+        None => GameState::first_hand(tiles),
+        Some(opener) => GameState::new(tiles, opener),
+    }
+}
+
+/// Opening policy (`Rules.md`), for the hand dealt after `previous`:
+/// * The first hand of a session (`None`) is opened by the holder of the
+///   **6|6**, who must lay it down — the engine picks that seat and enforces
+///   it as the forced opening tile.
+/// * Every later hand is opened by the previous hand's winner — a blocked
+///   hand is won by the fewest-pips seat. If the previous hand had no winner
+///   (a blocked tie, or a game voided by a departure), the open rotates one
+///   seat counter-clockwise from the previous opener; the same rotation is
+///   the defensive fallback for an unfinished game, which is never replaced
+///   in place.
+fn next_opener(previous: Option<&GameState>) -> Option<Seat> {
+    previous.map(|game| {
+        game.result()
+            .and_then(|result| result.winner)
+            .unwrap_or_else(|| (game.opener() + 1) % SEAT_COUNT)
+    })
+}
+
+/// Every rematch tap is cleared: each readiness flag starts the next
+/// rematch clock over.
+fn clear_readiness(seats: &mut [Option<Occupant>; SEAT_COUNT]) {
+    for occupant in seats.iter_mut().flatten() {
+        occupant.ready = false;
+    }
+}
+
+/// Sends each private hand strictly into its owner's outbox, before any
+/// public state can race ahead of it — a seat must never glimpse another
+/// seat's hand.
+fn deal_private_hands(seats: &mut [Option<Occupant>; SEAT_COUNT], game: &GameState) {
+    for (seat, occupant) in seats.iter_mut().enumerate() {
+        let occupant = occupant.as_mut().expect("table is full");
+        let hand = game.hand(seat).iter().copied().map(Into::into).collect();
+        let _ = occupant.outbox.send(ServerToClient::HandDealt { seat: seat as u8, hand });
+    }
 }
 
 /// Sends one message to every seated player. Because `join`/`leave`/`commit`
@@ -551,7 +569,7 @@ impl Default for Lobby {
 mod tests {
     use super::*;
     use crate::game::{EndReason, GameResult, HAND_SIZE, TILE_COUNT};
-    use crate::protocol::{ClosedHand, PublicGameState, Side};
+    use crate::protocol::{ClosedHand, PublicGameState, PublicTile, Side};
     type Event = ServerToClient;
 
     /// Registers `n` fake connections and hands back each one's minted id with
