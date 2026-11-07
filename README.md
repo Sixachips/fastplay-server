@@ -59,7 +59,7 @@ All messages are JSON objects with a top-level `"type"` discriminator. The wire 
 
 | Type | Fields | Description |
 |------|--------|-------------|
-| `JoinRoom` | `room` (String), `name` (String) | Join a room by code; name must be 1–32 chars. |
+| `JoinRoom` | `room` (String), `name` (String), `team` (0 \| 1, optional) | Join a room by code; name must be 1–32 chars. `team` is a best-effort partnership preference (0 = seats 0 & 2, 1 = seats 1 & 3); a full requested team never refuses the join, and the actual side is confirmed from `RoomState`. |
 | `PlayTile` | `tile` ( `{left: u8, right: u8}` ), `side` ( `"left"` \| `"right"` ) | Play a tile from your hand at the specified end. |
 | `PassTurn` | *(none)* | Pass your turn (only legal when you have no playable tile). |
 | `PlayAgain` | *(none)* | Signal readiness for the next game; the room re-deals in place once all four seated players are ready (no socket cycling). |
@@ -68,7 +68,7 @@ All messages are JSON objects with a top-level `"type"` discriminator. The wire 
 
 | Type | Fields | Description |
 |------|--------|-------------|
-| `RoomState` | `room` (`PublicRoomState`) | Personalized roster with `you` set to the recipient's seat. Each seat carries a `ready` flag (`true` once that player tapped `PlayAgain`). |
+| `RoomState` | `room` (`PublicRoomState`) | Personalized roster with `you` set to the recipient's seat. Each seat carries a `ready` flag (`true` once that player tapped `PlayAgain`) and a `team` (0 = seats 0 & 2, 1 = seats 1 & 3). |
 | `HandDealt` | `seat` (u8), `hand` (`Vec<PublicTile>`) | Sent privately to each seat when a game is dealt (7 tiles each, once per deal — never re-sent). |
 | `GameStateUpdate` | `state` (`PublicGameState`) | Broadcast after every accepted move or pass. |
 | `GameClosed` | `hands` (`Vec<ClosedHand>`) | Blocked-game reveal: every seat's remaining tiles, broadcast to all seats right after the terminating `GameStateUpdate`. Only sent when the game ends `blocked`. |

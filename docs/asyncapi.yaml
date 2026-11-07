@@ -1,7 +1,7 @@
 asyncapi: 3.1.0
 info:
   title: fastPlay Dominoes WebSocket Protocol
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Wire contract for `fastplay-server`, the authoritative WebSocket backend of
     the fastPlay double-six dominoes game.
@@ -10,6 +10,13 @@ info:
     `server/src/lobby.rs` (delivery, ordering, validation) and
     `server/src/game.rs` (engine semantics). The client mirrors these types in
     `client/src/protocol.rs`. Any change here must stay in sync with that file.
+
+    ## Changelog
+
+    * 0.2.0 — `JoinRoom` accepts an optional `team` (0 or 1) partnership
+      preference; `PublicSeat` now carries `team`. A full requested team never
+      refuses a join — the player is seated wherever a seat is free. Old clients
+      that omit `team` keep today's first-vacant-seat behavior.
 
     ## Transport
 
@@ -87,12 +94,18 @@ info:
     `0→1→2→3` walks counter-clockwise around the table (each move passes to
     the right-hand neighbour):
 
-    | Seat index | `table_side` |
-    |-----------|--------------|
-    | 0 | `north` |
-    | 1 | `west` |
-    | 2 | `south` |
-    | 3 | `east` |
+    | Seat index | `table_side` | Partnership |
+    |-----------|--------------|-------------|
+    | 0 | `north` | 0 |
+    | 1 | `west` | 1 |
+    | 2 | `south` | 0 |
+    | 3 | `east` | 1 |
+
+    A seat's partnership is `seat % 2`. On `JoinRoom` a client may express an
+    optional `team` preference (0 or 1); the server seats the player in a
+    vacant seat of that partnership when possible, otherwise in the first
+    vacant seat at the table. A full requested team never refuses a join. The
+    confirmed side is published per seat as `PublicSeat.team`.
 
     Vacant seats are simply absent from `RoomState.seats`. After a
     disconnect the survivors keep their seat numbers and the next joiner
@@ -121,6 +134,7 @@ info:
     | Pip out of range (not 0..6) | `pip values must be between 0 and 6` |
     | Bad room code | `room codes must be 1..=16 characters` |
     | Bad name | `player names must be 1..=32 characters` |
+    | Bad team preference | `team must be 0 or 1` |
     | Rejoin on a seated socket | `already seated in room "code"; disconnect to leave` |
     | Full room | `room "code" already has all four seats taken` |
     | Command before joining | `join a room before playing` |
@@ -250,6 +264,14 @@ components:
         receives a personalized `RoomState`; when this join completes a table
         of four and no game is live, `HandDealt` (private) and
         `GameStateUpdate` (broadcast) follow.
+
+        The optional `team` (0 or 1) states a partnership preference: team 0
+        holds seats 0 & 2 (north–south), team 1 holds seats 1 & 3 (west–east).
+        The server seats the player in a vacant seat of that partnership when
+        possible; a full requested team never refuses the join — the player is
+        seated wherever a seat is free, and the actual side is confirmed by
+        `RoomState.seats[*].team`. Omit `team` (or send `null`) for no
+        preference, which preserves today's first-vacant-seat behavior.
       payload:
         $ref: '#/components/schemas/JoinRoom'
       examples:
@@ -258,6 +280,12 @@ components:
             type: JoinRoom
             room: table-42
             name: Ada
+        - name: prefer the west–east partnership (team 1)
+          payload:
+            type: JoinRoom
+            room: table-42
+            name: Ada
+            team: 1
 
     PlayTile:
       title: PlayTile (client → server)
@@ -628,10 +656,17 @@ components:
           maxLength: 32
         table_side:
           $ref: '#/components/schemas/TableSide'
+        team:
+          type: integer
+          minimum: 0
+          maximum: 1
+          description: >-
+            Partnership this seat belongs to: `seat % 2` (team 0 = seats 0 & 2,
+            team 1 = seats 1 & 3).
         ready:
           type: boolean
           description: Whether this player tapped `PlayAgain` since the last deal.
-      required: [seat, player_id, name, table_side, ready]
+      required: [seat, player_id, name, table_side, team, ready]
       additionalProperties: false
 
     PublicRoomState:
@@ -836,6 +871,14 @@ components:
           minLength: 1
           maxLength: 32
           description: Display name; trimmed server-side, 1..=32 chars after trim.
+        team:
+          type: integer
+          minimum: 0
+          maximum: 1
+          description: >-
+            Optional partnership preference: 0 = seats 0 & 2 (north–south),
+            1 = seats 1 & 3 (west–east). Omit or `null` for no preference.
+            A full requested team never refuses the join.
       required: [type, room, name]
       additionalProperties: false
 
