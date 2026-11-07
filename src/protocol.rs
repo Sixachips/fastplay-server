@@ -14,7 +14,7 @@
 //! ```json
 //! {"type": "RoomState", "room": {"room_id": "table-42", "you": 0, "phase": "playing", "seats": [...]}}
 //! {"type": "HandDealt", "seat": 0, "hand": [{"left": 6, "right": 6}, ...]}
-//! {"type": "GameStateUpdate", "state": {"turn": 1, "board": [...], ...}}
+//! {"type": "GameStateUpdate", "state": {"turn": 1, "board": [...], "score": {"points": [52, 0], "target": 100, "winner_team": null, "over": false}, "result": null, ...}}
 //! {"type": "GameClosed", "hands": [{"seat": 0, "hand": [...]}, ...]}
 //! {"type": "MoveRejected", "reason": "it is not your turn"}
 //! {"type": "OpponentDisconnected", "player": "Bob", "seat": 2}
@@ -27,7 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::game::{self, GameResult, GameState, SEAT_COUNT, TableSide};
+use crate::game::{self, GameResult, GameState, MatchScore, TEAM_COUNT, SEAT_COUNT, TableSide};
 
 /// Which end of the linear board a tile is played on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,13 +179,43 @@ pub struct PublicGameState {
     pub opening_tile: Option<PublicTile>,
     /// How many passes were recorded in a row (resets on any play).
     pub consecutive_passes: u8,
-    /// Present once the game has ended (winner `None` means a draw or an
+    /// Present once the hand has ended (winner team `None` means a draw or an
     /// abandoned game).
     pub result: Option<GameResult>,
+    /// Running cumulative score for the current match of hands (standard
+    /// scoring: first partnership to `target` points wins).
+    pub score: PublicMatchScore,
+}
+
+/// The cumulative partnership score riding on every game snapshot. Team 0 is
+/// the North–South pair (seats 0 & 2), team 1 the West–East pair (seats 1 & 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicMatchScore {
+    /// Points banked per partnership (`points[0]` is team 0).
+    pub points: [u16; TEAM_COUNT],
+    /// The target that wins the match (`Rules.md`: 100).
+    pub target: u16,
+    /// The match-winning partnership, present only once the match is over.
+    pub winner_team: Option<u8>,
+    /// Whether a partnership has reached `target`.
+    pub over: bool,
+}
+
+impl From<&MatchScore> for PublicMatchScore {
+    fn from(score: &MatchScore) -> Self {
+        Self {
+            points: score.points(),
+            target: game::MATCH_TARGET,
+            winner_team: score.winner().map(|team| team as u8),
+            over: score.is_over(),
+        }
+    }
 }
 
 /// Builds the full public game view from the authoritative in-memory state.
-pub fn game_state_view(game: &GameState) -> PublicGameState {
+/// `score` is the room's running match score, folded in so a client reads the
+/// cumulative total straight off the snapshot it already handles.
+pub fn game_state_view(game: &GameState, score: &MatchScore) -> PublicGameState {
     PublicGameState {
         turn: game.turn(),
         board: game.board().chain().iter().copied().map(Into::into).collect(),
@@ -195,6 +225,7 @@ pub fn game_state_view(game: &GameState) -> PublicGameState {
         opening_tile: game.opening_tile().map(Into::into),
         consecutive_passes: game.passes_in_row() as u8,
         result: game.result(),
+        score: PublicMatchScore::from(score),
     }
 }
 
@@ -276,7 +307,7 @@ mod tests {
     #[test]
     fn game_state_view_hides_opponent_hands() {
         let tiles = game::Tile::full_set();
-        let state = game_state_view(&GameState::first_hand(tiles));
+        let state = game_state_view(&GameState::first_hand(tiles), &MatchScore::default());
         assert_eq!(state.hand_counts, [7, 7, 7, 7]);
         assert!(state.board.is_empty());
         assert!(state.left_end.is_none() && state.right_end.is_none());
@@ -286,6 +317,9 @@ mod tests {
             Some(PublicTile { left: 6, right: 6 }),
             "the first hand must be opened with the double six"
         );
+        assert_eq!(state.score.points, [0, 0], "a fresh match starts from zero");
+        assert_eq!(state.score.target, game::MATCH_TARGET);
+        assert!(!state.score.over);
     }
 
     #[test]
@@ -324,12 +358,12 @@ mod tests {
         tiles.extend(hand7(&[(0, 0), (3, 6), (4, 4), (4, 5), (4, 6), (5, 5), (5, 6)]));
         assert_eq!(tiles.len(), game::TILE_COUNT);
         let mut game = GameState::first_hand(tiles);
-        let opening = game_state_view(&game);
+        let opening = game_state_view(&game, &MatchScore::default());
         assert_eq!(opening.turn, 0, "seat 0 holds 6|6");
         assert_eq!(opening.opening_tile, Some(PublicTile { left: 6, right: 6 }));
 
         game.play(0, game::Tile::new(6, 6), game::Side::Right).expect("opens");
-        let view = game_state_view(&game);
+        let view = game_state_view(&game, &MatchScore::default());
         assert_eq!(view.turn, 1, "turn sits at the absolute next seat");
         assert_eq!(view.hand_counts, [6, 7, 7, 7], "only seat 0 lost a tile");
         assert_eq!((view.left_end, view.right_end), (Some(6), Some(6)));
@@ -338,12 +372,42 @@ mod tests {
     }
 
     #[test]
-    fn result_winner_travels_as_a_seat_number_on_the_wire() {
-        let json = serde_json::to_value(GameResult { winner: Some(3), reason: game::EndReason::Blocked })
-            .expect("serializable");
-        assert_eq!(json, serde_json::json!({ "winner": 3, "reason": "blocked" }));
-        let draw = serde_json::to_value(GameResult { winner: None, reason: game::EndReason::Abandoned })
-            .expect("serializable");
-        assert_eq!(draw, serde_json::json!({ "winner": null, "reason": "abandoned" }));
+    fn result_travels_with_the_winning_team_and_its_points() {
+        let blocked = GameResult {
+            out: None,
+            winner_team: Some(1),
+            points: 43,
+            hand_pips: [12, 4, 8, 39],
+            reason: game::EndReason::Blocked,
+        };
+        let json = serde_json::to_value(blocked).expect("serializable");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "out": null,
+                "winner_team": 1,
+                "points": 43,
+                "hand_pips": [12, 4, 8, 39],
+                "reason": "blocked"
+            })
+        );
+        let voided = serde_json::to_value(GameResult {
+            out: None,
+            winner_team: None,
+            points: 0,
+            hand_pips: [5, 5, 5, 5],
+            reason: game::EndReason::Abandoned,
+        })
+        .expect("serializable");
+        assert_eq!(
+            voided,
+            serde_json::json!({
+                "out": null,
+                "winner_team": null,
+                "points": 0,
+                "hand_pips": [5, 5, 5, 5],
+                "reason": "abandoned"
+            })
+        );
     }
 }

@@ -8,16 +8,25 @@
 //! Rules implemented here:
 //! * 28-tile double-six set, 7 tiles dealt to each of 4 seats (the boneyard is
 //!   empty, so passing is the only alternative to playing).
+//! * **Two fixed partnerships** (`Rules.md`): seats 0 & 2 (North–South) play
+//!   against seats 1 & 3 (West–East); teammates sit opposite each other and
+//!   every hand is won by a *team*, not a seat.
 //! * A single linear board ("the train") with a left and a right end. The
 //!   first tile played sets both ends and the requested side is ignored.
 //! * The first hand of a session is opened by the seat holding the 6|6, which
 //!   must lay that tile down to start the layout. Every later hand is opened
-//!   by the previous hand's winner (the fewest-pips seat of a blocked hand,
-//!   or the next seat counter-clockwise when a blocked hand is tied), who may
-//!   open with any tile of their choice.
+//!   by the seat that played out, or — when nobody played out (a blocked or
+//!   voided hand) — one seat counter-clockwise from the previous opener, and
+//!   may be opened with any tile.
 //! * A seat that cannot play must pass. Once every seat has passed in a row
-//!   the game is blocked and the seat with the fewest pips in hand wins
-//!   (a tie is a draw).
+//!   the game is blocked.
+//! * **Standard / Latin winning**: the partnership with the lower *combined*
+//!   pip total wins a blocked hand (equal team totals are a draw). A seat
+//!   that empties its hand wins the hand for its partnership outright.
+//! * **Standard cumulative scoring (100 points)**: the winning team scores
+//!   the pips left in the losing team's two hands. [`MatchScore`] tracks the
+//!   running total; the first team to reach [`MATCH_TARGET`] wins the match.
+
 
 use std::fmt;
 
@@ -31,9 +40,34 @@ pub const SEAT_COUNT: usize = 4;
 pub const HAND_SIZE: usize = 7;
 /// Tiles in the full double-six set.
 pub const TILE_COUNT: usize = 28;
+/// Partnerships at the table: seats {0, 2} versus seats {1, 3}.
+pub const TEAM_COUNT: usize = 2;
+/// Points a partnership must reach to win the match (`Rules.md`: standard
+/// cumulative scoring, first to 100).
+pub const MATCH_TARGET: u16 = 100;
 
 /// A seat at the table, `0..=3`.
 pub type Seat = usize;
+
+/// A partnership, `0..=1`. Team 0 is the North–South pair (seats 0 & 2),
+/// team 1 the West–East pair (seats 1 & 3): teammates sit opposite.
+pub type Team = usize;
+
+/// The partnership a seat belongs to. Seats are pinned to table sides
+/// (0 north, 1 west, 2 south, 3 east), so parity is the team.
+pub const fn team_of(seat: Seat) -> Team {
+    seat % TEAM_COUNT
+}
+
+/// The two seats of a partnership, opposite each other at the table.
+pub const fn team_seats(team: Team) -> [Seat; TEAM_COUNT] {
+    [team, team + TEAM_COUNT]
+}
+
+/// The opposing partnership.
+pub const fn rival_team(team: Team) -> Team {
+    (team + 1) % TEAM_COUNT
+}
 
 /// A domino. The unordered pair identifies the physical tile, so
 /// `Tile::new(3, 4) == Tile::new(4, 3)`; the struct is kept normalized
@@ -215,11 +249,24 @@ pub enum EndReason {
     Abandoned,
 }
 
-/// The final result of a game.
+/// The final result of one hand. The hand is won by a **partnership**
+/// (`Rules.md`), never by a lone seat: even when one player plays out, the
+/// points are the pips the opposing team failed to shed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameResult {
-    /// Winning seat, or `None` for a draw (e.g. a blocked game with tied pips).
-    pub winner: Option<Seat>,
+    /// The seat that emptied its hand, if anybody did (`hand_empty` endings
+    /// only). A blocked or voided hand has no playing-out seat.
+    pub out: Option<Seat>,
+    /// The winning partnership, or `None` for a draw (equal team pip totals
+    /// on a blocked hand) or a voided game.
+    pub winner_team: Option<Team>,
+    /// Points awarded to `winner_team` for this hand: the pips left in the
+    /// losing team's two hands (`Rules.md`: standard cumulative scoring).
+    /// Zero for draws and voided games — nobody scores a hand they abandoned.
+    pub points: u8,
+    /// Pips still held per absolute seat when the hand ended. Public from the
+    /// moment the hand is over; it is what the score is made of.
+    pub hand_pips: [u8; SEAT_COUNT],
     pub reason: EndReason,
 }
 
@@ -228,6 +275,54 @@ impl GameResult {
     /// tile. A closed game reveals every remaining hand to every player.
     pub fn is_closed(self) -> bool {
         self.reason == EndReason::Blocked
+    }
+}
+
+/// Cumulative partnership score across the hands of one match (standard
+/// scoring, first to [`MATCH_TARGET`] points). Pure room-level bookkeeping:
+/// the engine records hand results into it, the room owns the instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MatchScore {
+    points: [u16; TEAM_COUNT],
+    winner_team: Option<Team>,
+    over: bool,
+}
+
+impl MatchScore {
+    /// Fold a finished hand into the running totals. Only the winning team
+    /// ever scores, so at most one team can cross the target per hand. Once
+    /// the match is decided nothing more banks — the reset for the next match
+    /// is explicit, never implicit drift.
+    pub fn record(&mut self, result: GameResult) {
+        if let Some(team) = result.winner_team {
+            if self.over {
+                return;
+            }
+            self.points[team] += u16::from(result.points);
+            if self.points[team] >= MATCH_TARGET {
+                self.over = true;
+                self.winner_team = Some(team);
+            }
+        }
+    }
+
+    pub fn points(&self) -> [u16; TEAM_COUNT] {
+        self.points
+    }
+
+    /// Whether a partnership has reached the target.
+    pub fn is_over(&self) -> bool {
+        self.over
+    }
+
+    /// The match-winning partnership once the match is over.
+    pub fn winner(&self) -> Option<Team> {
+        self.winner_team
+    }
+
+    /// Wipe the slate for a brand-new match.
+    pub fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -380,6 +475,45 @@ impl GameState {
         totals
     }
 
+    /// Combined pips of each partnership — the Standard / Latin measure that
+    /// decides blocked hands and losing-team points.
+    pub fn team_pip_totals(&self) -> [u16; TEAM_COUNT] {
+        let seat_pips = self.pip_totals();
+        std::array::from_fn(|team| {
+            u16::from(seat_pips[team]) + u16::from(seat_pips[team + TEAM_COUNT])
+        })
+    }
+
+    /// Resolve a finished hand into its result from the current pip state:
+    /// * a seat that played out hands the hand to its team;
+    /// * a blocked hand goes to the team with the lower combined pips —
+    ///   equal team totals are a draw (Latin rules);
+    /// * the winners score the pips left in the losing team's two hands;
+    /// * an abandoned hand scores nothing.
+    fn settle(&self, out: Option<Seat>, reason: EndReason) -> GameResult {
+        let team_totals = self.team_pip_totals();
+        let loser_pips = |team: Team| -> u8 {
+            u8::try_from(team_totals[rival_team(team)]).expect("two dealt hands fit in a u8")
+        };
+        let (winner_team, points) = match reason {
+            EndReason::HandEmpty => {
+                let seat = out.expect("playing out names the seat that went out");
+                let team = team_of(seat);
+                (Some(team), loser_pips(team))
+            }
+            EndReason::Blocked => {
+                if team_totals[0] == team_totals[1] {
+                    (None, 0)
+                } else {
+                    let team = usize::from(team_totals[1] < team_totals[0]);
+                    (Some(team), loser_pips(team))
+                }
+            }
+            EndReason::Abandoned => (None, 0),
+        };
+        GameResult { out, winner_team, points, hand_pips: self.pip_totals(), reason }
+    }
+
     /// Consecutive passes just recorded by the engine.
     pub fn passes_in_row(&self) -> usize {
         self.passes_in_row
@@ -451,11 +585,10 @@ impl GameState {
         }
         self.passes_in_row = 0;
 
-        // Resolve the outcome: an emptied hand wins immediately, otherwise
-        // play passes to the next seat.
+        // Resolve the outcome: an emptied hand wins the hand for the seat's
+        // partnership, otherwise play passes to the next seat.
         if self.hands[seat].is_empty() {
-            let result = GameResult { winner: Some(seat), reason: EndReason::HandEmpty };
-            return Ok(self.end_with(result));
+            return Ok(self.end_with(self.settle(Some(seat), EndReason::HandEmpty)));
         }
         self.turn = (self.turn + 1) % SEAT_COUNT;
         Ok(Outcome::Continued)
@@ -506,16 +639,9 @@ impl GameState {
         }
         self.passes_in_row += 1;
         if self.passes_in_row >= SEAT_COUNT {
-            let totals = self.pip_totals();
-            let min = totals.iter().copied().min().expect("four seats exist");
-            let tied = totals.iter().filter(|&&p| p == min).count();
-            let winner = if tied == 1 {
-                Some(totals.iter().position(|&p| p == min).expect("minimum exists"))
-            } else {
-                None
-            };
-            let result = GameResult { winner, reason: EndReason::Blocked };
-            return Ok(self.end_with(result));
+            // Four passes in a row close the hand: the partnership with the
+            // lower combined pips wins it (a draw when the totals tie).
+            return Ok(self.end_with(self.settle(None, EndReason::Blocked)));
         }
         self.turn = (self.turn + 1) % SEAT_COUNT;
         Ok(Outcome::Continued)
@@ -525,7 +651,7 @@ impl GameState {
     /// already ended stays untouched; the caller can confirm with
     /// [`GameState::is_finished`].
     pub fn abandon(&mut self) -> Outcome {
-        self.end_with(GameResult { winner: None, reason: EndReason::Abandoned })
+        self.end_with(self.settle(None, EndReason::Abandoned))
     }
 
     /// Like [`GameState::abandon`], but only when the game is still live.
@@ -743,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_game_resolves_by_lowest_pip_count() {
+    fn blocked_game_resolves_by_lowest_team_pip_total() {
         // Seat 0 keeps a spare 0|0 so playing the double does not empty its
         // hand; the game must end by blocking, not by dominoing out.
         let mut game = GameState::from_hands([
@@ -756,14 +882,19 @@ mod tests {
         assert_eq!(game.pass(1).expect("no six in hand"), Outcome::Continued);
         assert_eq!(game.pass(2).expect("no six in hand"), Outcome::Continued);
         assert_eq!(game.pass(3).expect("no six in hand"), Outcome::Continued);
-        // Next around to seat 0, whose remaining 0|0 matches neither end (0
-        // and 0 vs. ends 6 and 6 — no six anywhere else at the table), so it
-        // must pass as well: the fourth consecutive pass blocks the game and
-        // the empty-ish hand wins with 0 pips.
+        // Four consecutive passes block the hand. Combined team pips decide
+        // it: team 0 (seats 0 & 2) holds 0 + 4 = 4, team 1 (seats 1 & 3) holds
+        // 2 + 6 = 8, so the North–South pair wins and banks the 8 losing pips.
         let blocked = game.pass(0).expect("fourth pass ends the game");
         assert_eq!(
             blocked,
-            Outcome::Ended(GameResult { winner: Some(0), reason: EndReason::Blocked })
+            Outcome::Ended(GameResult {
+                out: None,
+                winner_team: Some(0),
+                points: 8,
+                hand_pips: [0, 2, 4, 6],
+                reason: EndReason::Blocked,
+            })
         );
         assert!(game.is_finished());
         assert_eq!(game.play(1, Tile::new(1, 1), Side::Right), Err(MoveError::GameNotActive));
@@ -771,21 +902,31 @@ mod tests {
     }
 
     #[test]
-    fn blocked_game_with_tied_pips_is_a_draw() {
+    fn blocked_game_with_tied_team_totals_is_a_draw() {
+        // Team 0 (seats 0 & 2) ends on 0 + 4 = 4 pips and team 1 (seats 1 & 3)
+        // on 2 + 2 = 4: the partnerships tie, so the blocked hand is a draw
+        // and nobody scores.
         let mut game = GameState::from_hands([
-            vec![Tile::new(6, 6), Tile::new(0, 2)],
+            vec![Tile::new(6, 6), Tile::new(0, 0)],
+            vec![Tile::new(0, 2)],
+            vec![Tile::new(2, 2)],
             vec![Tile::new(1, 1)],
-            vec![Tile::new(1, 2)],
-            vec![Tile::new(3, 3)],
         ]);
         game.play(0, Tile::new(6, 6), Side::Right).expect("first move");
         for seat in 1..SEAT_COUNT {
             game.pass(seat).expect("no pip-6 tiles remain in the other hands");
         }
-        // Fourth consecutive pass blocks the game; seats 0 and 1 both hold 2
-        // pips, the shared minimum, so the game is a draw.
         let draw = game.pass(0).expect("fourth pass ends the game");
-        assert_eq!(draw, Outcome::Ended(GameResult { winner: None, reason: EndReason::Blocked }));
+        assert_eq!(
+            draw,
+            Outcome::Ended(GameResult {
+                out: None,
+                winner_team: None,
+                points: 0,
+                hand_pips: [0, 2, 4, 2],
+                reason: EndReason::Blocked,
+            })
+        );
     }
 
     #[test]
@@ -820,9 +961,17 @@ mod tests {
             if round < HAND_SIZE - 1 {
                 assert_eq!(outcome, Outcome::Continued);
             } else {
+                // Playing out wins for team 0; every hand is empty in this
+                // staged setup, so there are no losing pips to bank.
                 assert_eq!(
                     outcome,
-                    Outcome::Ended(GameResult { winner: Some(0), reason: EndReason::HandEmpty })
+                    Outcome::Ended(GameResult {
+                        out: Some(0),
+                        winner_team: Some(0),
+                        points: 0,
+                        hand_pips: [0, 0, 0, 0],
+                        reason: EndReason::HandEmpty,
+                    })
                 );
             }
         }
@@ -895,7 +1044,13 @@ mod tests {
         ]);
         assert_eq!(
             over.play(0, Tile::new(6, 6), Side::Right),
-            Ok(Outcome::Ended(GameResult { winner: Some(0), reason: EndReason::HandEmpty }))
+            Ok(Outcome::Ended(GameResult {
+                out: Some(0),
+                winner_team: Some(0),
+                points: 2,
+                hand_pips: [0, 2, 0, 0],
+                reason: EndReason::HandEmpty,
+            }))
         );
         assert_eq!(over.play(0, Tile::new(6, 6), Side::Right), Err(MoveError::GameNotActive));
         assert_eq!(over.play(1, Tile::new(1, 1), Side::Right), Err(MoveError::GameNotActive));
@@ -945,9 +1100,9 @@ mod tests {
         // Scripted full cycle: seat 0 opens 6|6; every hand is six-blind
         // except seat 3's 5|6 (one extra placement). The turn must walk
         // 0→1→2→3→0→1→2→3 with no seat skipped or revisited, ending blocked
-        // with the lowest pips at the ABSOLUTE seat 3 — a winner taken from
-        // the pass order (3,0,1,2 → index 0) or from an occupied-seat list
-        // would report something else here.
+        // with team 1 (seats 1 & 3: 7 + 0 pips) beating team 0 (3 + 14) —
+        // seat 3's 0 pips matter only through its partnership total, and the
+        // totals/pips are indexed by ABSOLUTE seat, not pass order.
         let mut game = GameState::from_hands([
             vec![Tile::new(6, 6), Tile::new(1, 1), Tile::new(0, 1)], // 3 pips left after opening
             vec![Tile::new(2, 2), Tile::new(1, 2)],                  // 7 pips
@@ -983,14 +1138,27 @@ mod tests {
         // blocks the game.
         assert_eq!(
             game.pass(3).expect("fourth consecutive pass"),
-            Outcome::Ended(GameResult { winner: Some(3), reason: EndReason::Blocked })
+            Outcome::Ended(GameResult {
+                out: None,
+                winner_team: Some(1),
+                points: 17,
+                hand_pips: [3, 7, 14, 0],
+                reason: EndReason::Blocked,
+            })
         );
 
-        // The blocked winner is the absolute seat 3 (0 pips vs 3/14/14):
-        // pip_totals is seat-indexed, so `position` == seat here.
+        // Team 1 (seats 1 & 3) holds 7 + 0 = 7 pips against team 0's
+        // 3 + 14 = 17, so the partnership — not the individually-lowest seat
+        // alone — takes the hand and banks the rivals' 17.
         assert_eq!(
             game.result(),
-            Some(GameResult { winner: Some(3), reason: EndReason::Blocked })
+            Some(GameResult {
+                out: None,
+                winner_team: Some(1),
+                points: 17,
+                hand_pips: [3, 7, 14, 0],
+                reason: EndReason::Blocked,
+            })
         );
         // Conservation: nothing left the table unaccounted for, and the
         // seat-indexed counts match the hidden hands exactly after every step.
@@ -1002,27 +1170,137 @@ mod tests {
     }
 
     #[test]
-    fn blocked_winner_is_a_seat_number_even_when_the_opener_passes_last() {
-        // The opener (seat 1) also makes the sealing fourth pass, so the
-        // pip-minimum seat (0) differs from both its pass-order position
-        // (second passer, would report 2) and any occupied-list index.
+    fn blocked_hand_goes_to_the_team_even_when_a_rival_passes_last() {
+        // The opener (seat 1) also makes the sealing fourth pass, yet it is
+        // the partnership measure that decides: team 0 (seats 0 & 2) holds
+        // 0 + 4 = 4 against team 1's 3 + 6 = 9 — so team 0 wins although its
+        // seats neither opened nor closed the circle.
         let mut game = GameState::from_hands([
-            vec![Tile::new(0, 0)],                                     // 0 pips, but NOT the opener
+            vec![Tile::new(0, 0)],                                     // 0 pips
             vec![Tile::new(6, 6), Tile::new(1, 2)],                    // opener, 3 pips left
-            vec![Tile::new(2, 2)],
-            vec![Tile::new(3, 3)],
+            vec![Tile::new(2, 2)],                                     // seat 0's partner, 4 pips
+            vec![Tile::new(3, 3)],                                     // 6 pips
         ]);
         assert_eq!(game.turn(), 1);
         game.play(1, Tile::new(6, 6), Side::Right).expect("opens");
         for (order, seat) in [2usize, 3, 0, 1].into_iter().enumerate() {
             let outcome = game.pass(seat).expect("no six outside the played 6|6");
             if order == 3 {
-                assert_eq!(outcome, Outcome::Ended(GameResult { winner: Some(0), reason: EndReason::Blocked }));
+                assert_eq!(
+                    outcome,
+                    Outcome::Ended(GameResult {
+                        out: None,
+                        winner_team: Some(0),
+                        points: 9,
+                        hand_pips: [0, 3, 4, 6],
+                        reason: EndReason::Blocked,
+                    })
+                );
             } else {
                 assert_eq!(outcome, Outcome::Continued);
                 assert_eq!(game.turn(), (seat + 1) % SEAT_COUNT);
             }
         }
+    }
+
+    #[test]
+    fn a_low_individual_hand_on_the_losing_team_does_not_win_the_hand() {
+        // Latin rules compare *combined* team pips. Seat 0 alone is lowest at
+        // 0 pips, but its partner (seat 2) sits on 20, while team 1's players
+        // hold 6 and 4: the North–South pair loses despite having the best
+        // individual hand.
+        let mut game = GameState::from_hands([
+            vec![Tile::new(6, 6), Tile::new(0, 0)],                    // opens, keeps 0 pips
+            vec![Tile::new(3, 3)],                                     // 6 pips
+            vec![Tile::new(5, 5), Tile::new(4, 4), Tile::new(1, 1)],   // partner, 20 pips
+            vec![Tile::new(2, 2)],                                     // 4 pips
+        ]);
+        assert_eq!(game.turn(), 0, "the 6|6 holder opens");
+        game.play(0, Tile::new(6, 6), Side::Right).expect("opens");
+        for seat in [1, 2, 3, 0] {
+            let outcome = game.pass(seat).expect("no six outside the opening double");
+            if seat == 0 {
+                assert_eq!(
+                    outcome,
+                    Outcome::Ended(GameResult {
+                        out: None,
+                        winner_team: Some(1),
+                        points: 20,
+                        hand_pips: [0, 6, 20, 4],
+                        reason: EndReason::Blocked,
+                    })
+                );
+            } else {
+                assert_eq!(outcome, Outcome::Continued);
+            }
+        }
+    }
+
+    #[test]
+    fn playing_out_scores_the_pips_left_in_the_rival_hands() {
+        // Seat 0 drains two tiles; its partner keeps 9 pips (which earn
+        // nothing) while the rivals hold 5 + 7 = 12 — the exact score the
+        // winning partnership banks on playing out.
+        let mut game = GameState::from_hands([
+            vec![Tile::new(0, 0), Tile::new(0, 1)],
+            vec![Tile::new(2, 3)],
+            vec![Tile::new(4, 5)],
+            vec![Tile::new(3, 4)],
+        ]);
+        assert_eq!(game.turn(), 0, "seat 0 holds the only double");
+        assert_eq!(game.play(0, Tile::new(0, 0), Side::Right), Ok(Outcome::Continued));
+        for seat in [1, 2, 3] {
+            assert_eq!(game.pass(seat).expect("no zero in the rival hands"), Outcome::Continued);
+        }
+        assert_eq!(
+            game.play(0, Tile::new(0, 1), Side::Right),
+            Ok(Outcome::Ended(GameResult {
+                out: Some(0),
+                winner_team: Some(0),
+                points: 12,
+                hand_pips: [0, 5, 9, 7],
+                reason: EndReason::HandEmpty,
+            }))
+        );
+    }
+
+    #[test]
+    fn the_match_ends_at_one_hundred_points() {
+        let mut score = MatchScore::default();
+        let win = |points: u8| GameResult {
+            out: None,
+            winner_team: Some(0),
+            points,
+            hand_pips: [0, 0, 0, 0],
+            reason: EndReason::Blocked,
+        };
+
+        score.record(win(52));
+        assert_eq!(score.points(), [52, 0]);
+        assert!(!score.is_over());
+
+        // Draws and voided hands bank nothing.
+        score.record(GameResult {
+            out: None,
+            winner_team: None,
+            points: 9,
+            hand_pips: [4, 4, 4, 4],
+            reason: EndReason::Blocked,
+        });
+        assert_eq!(score.points(), [52, 0], "a drawn hand awards no points");
+
+        score.record(win(48));
+        assert_eq!(score.points(), [100, 0]);
+        assert!(score.is_over(), "reaching the target ends the match");
+        assert_eq!(score.winner(), Some(0));
+
+        // A finished match keeps its final numbers until the reset that opens
+        // the next one.
+        score.record(win(10));
+        assert_eq!(score.points(), [100, 0], "a decided match banks no more");
+
+        score.reset();
+        assert_eq!(score, MatchScore::default());
     }
 
     #[test]

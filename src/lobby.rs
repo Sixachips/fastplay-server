@@ -30,7 +30,7 @@ use dashmap::DashMap;
 use rand::{seq::SliceRandom, thread_rng};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::game::{GameState, MoveError, Outcome, Seat, SEAT_COUNT, Side, TableSide, Tile};
+use crate::game::{GameState, MatchScore, MoveError, Outcome, Seat, SEAT_COUNT, Side, TableSide, Tile};
 use crate::protocol::{
     closed_hands_view, game_state_view, ClientToServer, PublicRoomState, PublicSeat, RoomPhase,
     ServerToClient,
@@ -73,6 +73,10 @@ struct RoomInner {
     /// `Some` only while a dealt game exists, including finished ones (kept
     /// for the final board view; a refill triggers a fresh deal).
     game: Option<GameState>,
+    /// Cumulative partnership score for the current match of hands. Survives
+    /// every redeal; wiped by `deal_fresh_game` when it follows a finished
+    /// match so the next four seats start a clean one.
+    score: MatchScore,
 }
 
 #[derive(Debug)]
@@ -290,7 +294,11 @@ impl Room {
     fn new(code: String) -> Self {
         Self {
             code,
-            inner: Mutex::new(RoomInner { seats: std::array::from_fn(|_| None), game: None }),
+            inner: Mutex::new(RoomInner {
+                seats: std::array::from_fn(|_| None),
+                game: None,
+                score: MatchScore::default(),
+            }),
         }
     }
 
@@ -349,9 +357,9 @@ impl Room {
     }
 
     /// Removes a player from the room. A running game is voided
-    /// (`GameResult { winner: None, reason: "abandoned" }`) rather than
-    /// simulated on for the empty seat; the terminating result travels in the
-    /// follow-up `GameStateUpdate`.
+    /// (`GameResult { winner_team: None, points: 0, reason: "abandoned" }`)
+    /// rather than simulated on for the empty seat; the terminating result
+    /// travels in the follow-up `GameStateUpdate`.
     async fn leave(&self, player: PlayerId) {
         let mut inner = self.inner.lock().await;
         let Some(seat) = inner.seats.iter().position(|o| {
@@ -373,7 +381,10 @@ impl Room {
             .as_mut()
             .is_some_and(|game| game.abandon_if_live());
         if game_ended {
-            let state = game_state_view(inner.game.as_ref().expect("live game just ended"));
+            let state = game_state_view(
+                inner.game.as_ref().expect("live game just ended"),
+                &inner.score,
+            );
             broadcast(&inner.seats, ServerToClient::GameStateUpdate { state });
         }
 
@@ -388,27 +399,36 @@ impl Room {
         player: PlayerId,
         action: impl FnOnce(Seat, &mut GameState) -> Result<Outcome, MoveError>,
     ) -> Result<(), String> {
-        let mut inner = self.inner.lock().await;
-        let seat = inner
-            .seats
+        let mut guard = self.inner.lock().await;
+        // Split the guard once so the game, the score, and the seats are all
+        // writable side by side (field borrows through `DerefMut` alone would
+        // conflict).
+        let RoomInner { seats, game, score } = &mut *guard;
+        let seat = seats
             .iter()
             .position(|o| o.as_ref().is_some_and(|o| o.player_id == player))
             .ok_or("you are not seated in this room")?;
-        let game = inner.game.as_mut().ok_or("no game has been dealt in this room yet")?;
+        let game = game.as_mut().ok_or("no game has been dealt in this room yet")?;
 
         match action(seat, game) {
             Ok(outcome) => {
+                // A finished hand folds its points into the running match
+                // score *before* the snapshot is built, so the terminating
+                // update already carries the banked total.
+                if let Outcome::Ended(result) = outcome {
+                    score.record(result);
+                }
                 // Build every payload while `game` is borrowed, then fan out.
-                let state = game_state_view(game);
+                let state = game_state_view(game, score);
                 // The game closed — nobody can put a tile: prepare the
                 // all-hands reveal that follows the terminating snapshot.
                 let revealed = matches!(outcome, Outcome::Ended(result) if result.is_closed())
                     .then(|| closed_hands_view(game));
                 // Still holding the room mutex: this update is ordered after
                 // every earlier one and before any later mutation, per client.
-                broadcast(&inner.seats, ServerToClient::GameStateUpdate { state });
+                broadcast(seats, ServerToClient::GameStateUpdate { state });
                 if let Some(hands) = revealed {
-                    broadcast(&inner.seats, ServerToClient::GameClosed { hands });
+                    broadcast(seats, ServerToClient::GameClosed { hands });
                 }
                 Ok(())
             }
@@ -445,13 +465,20 @@ impl Room {
 /// Deals a fresh game to a full table whose current game is finished (or
 /// which has never had one). Hands go straight into their owners' outboxes;
 /// the opening snapshot fans out to everyone afterwards.
+///
+/// If the match that just ended had reached its target, the running score is
+/// wiped first so the new hand opens a clean match (`Rules.md`: first to 100
+/// wins; tapping "Play again" after a match win starts the next one).
 fn deal_fresh_game(inner: &mut RoomInner) {
+    if inner.score.is_over() {
+        inner.score.reset();
+    }
     let game = fresh_game(inner.game.as_ref());
 
     clear_readiness(&mut inner.seats);
     deal_private_hands(&mut inner.seats, &game);
 
-    let opening = game_state_view(&game);
+    let opening = game_state_view(&game, &inner.score);
     inner.game = Some(game);
     broadcast(&inner.seats, ServerToClient::GameStateUpdate { state: opening });
 }
@@ -471,16 +498,15 @@ fn fresh_game(previous: Option<&GameState>) -> GameState {
 /// * The first hand of a session (`None`) is opened by the holder of the
 ///   **6|6**, who must lay it down — the engine picks that seat and enforces
 ///   it as the forced opening tile.
-/// * Every later hand is opened by the previous hand's winner — a blocked
-///   hand is won by the fewest-pips seat. If the previous hand had no winner
-///   (a blocked tie, or a game voided by a departure), the open rotates one
-///   seat counter-clockwise from the previous opener; the same rotation is
-///   the defensive fallback for an unfinished game, which is never replaced
-///   in place.
+/// * Every later hand is opened by the previous hand's *playing-out seat* (the
+///   one who emptied their hand). A blocked hand has no playing-out seat — it
+///   is won by a partnership on pips, not by a player — so the open simply
+///   rotates one seat counter-clockwise from the previous opener, as does a
+///   voided game or the defensive fallback for an unfinished hand.
 fn next_opener(previous: Option<&GameState>) -> Option<Seat> {
     previous.map(|game| {
         game.result()
-            .and_then(|result| result.winner)
+            .and_then(|result| result.out)
             .unwrap_or_else(|| (game.opener() + 1) % SEAT_COUNT)
     })
 }
@@ -699,7 +725,8 @@ mod tests {
                         if let Some(result) = state.result {
                             voided = true;
                             assert_eq!(result.reason, EndReason::Abandoned);
-                            assert_eq!(result.winner, None);
+                            assert_eq!(result.winner_team, None, "a voided hand crowns nobody");
+                            assert_eq!(result.points, 0, "a voided hand scores nothing");
                         }
                     }
                     Event::RoomState { room } => roster = Some(room.clone()),
@@ -905,28 +932,45 @@ mod tests {
             match next.result {
                 None => {
                     assert_eq!(next.turn, (actor + 1) % SEAT_COUNT, "turn walks one seat to the right");
+                    assert_eq!(next.score.points, [0, 0], "the match score stays blank inside a live hand");
                 }
                 Some(result) => {
                     assert_eq!(next.turn, actor, "the turn freezes when the game ends");
+                    let pips: [u8; SEAT_COUNT] = std::array::from_fn(|seat| {
+                        hands[seat].iter().map(|tile| tile.left + tile.right).sum()
+                    });
+                    assert_eq!(result.hand_pips, pips, "the result must publish the pips every hand ended on");
+                    let team_pips = [
+                        u16::from(pips[0]) + u16::from(pips[2]),
+                        u16::from(pips[1]) + u16::from(pips[3]),
+                    ];
                     match result.reason {
                         EndReason::HandEmpty => {
                             assert!(closed.is_none(), "a played-out game reveals no hidden hands");
-                            assert_eq!(result.winner, Some(actor), "the seat that just emptied its hand wins");
+                            assert_eq!(result.out, Some(actor), "the seat that just emptied its hand played out");
+                            let team = actor % 2;
+                            assert_eq!(result.winner_team, Some(team), "playing out wins the hand for the seat's partnership");
+                            assert_eq!(
+                                result.points,
+                                u8::try_from(team_pips[1 - team]).expect("two hands fit in a u8"),
+                                "the winners bank the pips left in the rival partnership"
+                            );
                             assert!(hands[actor].is_empty());
                         }
                         EndReason::Blocked => {
-                            // Winner = the absolute seat with the fewest pips,
-                            // recomputed from the hands the clients were dealt.
-                            let pips: [u8; SEAT_COUNT] = std::array::from_fn(|seat| {
-                                hands[seat].iter().map(|tile| tile.left + tile.right).sum()
-                            });
-                            let min = pips.iter().copied().min().expect("four seats");
-                            let fewest: Vec<usize> = (0..SEAT_COUNT).filter(|&s| pips[s] == min).collect();
+                            assert_eq!(result.out, None, "a blocked hand has no playing-out seat");
+                            let (expected_team, expected_points) = if team_pips[0] == team_pips[1] {
+                                (None, 0u16)
+                            } else if team_pips[0] < team_pips[1] {
+                                (Some(0), team_pips[1])
+                            } else {
+                                (Some(1), team_pips[0])
+                            };
                             assert_eq!(
-                                result.winner,
-                                if fewest.len() == 1 { Some(fewest[0]) } else { None },
-                                "blocked winner must be the pip-minimum seat index (pips: {pips:?})"
+                                result.winner_team, expected_team,
+                                "blocked winner must be the team with the lower combined pips (pips: {pips:?})"
                             );
+                            assert_eq!(u16::from(result.points), expected_points, "points = the losing team's pips");
                             // A closed game also lands a `GameClosed` reveal on every
                             // seat: one entry per absolute seat, matching exactly the
                             // tiles the seats are still holding.
@@ -942,6 +986,16 @@ mod tests {
                         }
                         EndReason::Abandoned => unreachable!("nobody left in this test"),
                     }
+                    // The terminating snapshot already carries the awarded points.
+                    let expected_score = std::array::from_fn(|team| {
+                        if result.winner_team == Some(team) { u16::from(result.points) } else { 0 }
+                    });
+                    assert_eq!(next.score.points, expected_score, "the ending snapshot carries the match score");
+                    assert_eq!(
+                        next.score.over,
+                        expected_score.iter().any(|p| *p >= next.score.target),
+                        "the match flips to over exactly when a team reaches the target"
+                    );
                     ended = Some(result);
                     break;
                 }
@@ -989,7 +1043,7 @@ mod tests {
                     Event::GameStateUpdate { state } => {
                         if let Some(result) = state.result {
                             assert_eq!(result.reason, EndReason::Abandoned);
-                            assert_eq!(result.winner, None);
+                            assert_eq!(result.winner_team, None);
                             voided = Some(result);
                         }
                     }
@@ -1152,7 +1206,12 @@ mod tests {
                     Event::GameStateUpdate { state } => {
                         let result = state.result.expect("the fourth pass ends the game");
                         assert_eq!(result.reason, EndReason::Blocked);
-                        assert_eq!(result.winner, Some(0), "seat 0 has the fewest pips left (0)");
+                        // Team 0 (seats 0 & 2) ends on 0 + 4 = 4 pips, team 1
+                        // on 2 + 6 = 8, so the North–South pair wins and banks
+                        // the rivals' 8.
+                        assert_eq!(result.winner_team, Some(0), "the lower-pip partnership wins the close");
+                        assert_eq!(result.points, 8, "the winners bank the losing team's pips");
+                        assert_eq!(result.out, None, "a blocked hand has no playing-out seat");
                         closed_update = true;
                     }
                     Event::GameClosed { hands } => reveal = Some(hands),
@@ -1317,7 +1376,7 @@ mod tests {
         ]);
         assert_eq!(finished.turn(), 2);
         finished.play(2, Tile::new(6, 6), crate::game::Side::Right).expect("plays out");
-        assert_eq!(finished.result().and_then(|result| result.winner), Some(2));
+        assert_eq!(finished.result().and_then(|result| result.out), Some(2));
         let room = lobby.room_for("a").expect("filled room");
         room.inner.lock().await.game = Some(finished);
 
@@ -1333,14 +1392,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_blocked_rematch_is_opened_by_the_fewest_pips_seat() {
+    async fn a_blocked_rematch_rotates_the_open_from_the_previous_opener() {
         let (lobby, mut seats) = fill_table().await;
         for (_, rx) in seats.iter_mut() {
             while rx.try_recv().is_ok() {}
         }
 
-        // Seat 1 opens the 6|6 and keeps 1|2; seat 0 keeps 0|0 (0 pips) and
-        // seals the block. The pip-minimum seat wins and takes the next open.
+        // Seat 1 opens the 6|6 and keeps 1|2; seat 0 keeps 0|0. Blocked hand:
+        // team 0 (seats 0 & 2 = 0 + 4 pips) beats team 1 (seats 1 & 3 = 3 + 6).
+        // No single seat "wins" a blocked hand, so the open rotates one seat
+        // counter-clockwise from the previous opener (seat 1 → seat 2).
         let mut finished = GameState::from_hands([
             vec![Tile::new(0, 0)],
             vec![Tile::new(6, 6), Tile::new(1, 2)],
@@ -1354,7 +1415,13 @@ mod tests {
         }
         assert_eq!(
             finished.result(),
-            Some(GameResult { winner: Some(0), reason: EndReason::Blocked })
+            Some(GameResult {
+                out: None,
+                winner_team: Some(0),
+                points: 9,
+                hand_pips: [0, 3, 4, 6],
+                reason: EndReason::Blocked,
+            })
         );
         let room = lobby.room_for("a").expect("filled room");
         room.inner.lock().await.game = Some(finished);
@@ -1365,7 +1432,8 @@ mod tests {
 
         let inner = room.inner.lock().await;
         let game = inner.game.as_ref().expect("the rematch dealt a fresh hand");
-        assert_eq!(game.turn(), 0, "the fewest-pips seat takes the next opening turn");
+        assert_eq!(game.turn(), 2, "a blocked hand rotates the open off its opener");
+        assert_eq!(game.opener(), 2);
         assert_eq!(game.opening_tile(), None);
     }
 
@@ -1376,13 +1444,14 @@ mod tests {
             while rx.try_recv().is_ok() {}
         }
 
-        // Seat 2 opens the 6|6 and keeps 0|4; seats 0 and 1 tie on 3 pips, so
-        // the blocked hand has no winner and the open rotates from seat 2.
+        // Seat 2 opens the 6|6 and keeps 0|4. Team 0 (seats 0 & 2) and team 1
+        // (seats 1 & 3) both finish on 7 combined pips, so the blocked hand is
+        // a genuine partnership tie and the open rotates from seat 2 to seat 3.
         let mut finished = GameState::from_hands([
-            vec![Tile::new(1, 2)],
-            vec![Tile::new(0, 3)],
-            vec![Tile::new(6, 6), Tile::new(0, 4)],
-            vec![Tile::new(5, 5)],
+            vec![Tile::new(1, 2)],                                     // 3 pips
+            vec![Tile::new(0, 3)],                                     // 3 pips
+            vec![Tile::new(6, 6), Tile::new(0, 4)],                    // opener keeps 4
+            vec![Tile::new(2, 2)],                                     // 4 pips
         ]);
         assert_eq!(finished.turn(), 2, "6|6 is the highest double");
         finished.play(2, Tile::new(6, 6), crate::game::Side::Right).expect("opens");
@@ -1391,8 +1460,14 @@ mod tests {
         }
         assert_eq!(
             finished.result(),
-            Some(GameResult { winner: None, reason: EndReason::Blocked }),
-            "equal pips at seats 0 and 1 make the blocked hand a draw"
+            Some(GameResult {
+                out: None,
+                winner_team: None,
+                points: 0,
+                hand_pips: [3, 3, 4, 4],
+                reason: EndReason::Blocked,
+            }),
+            "tied team totals (7 = 7) make the blocked hand a draw"
         );
         let room = lobby.room_for("a").expect("filled room");
         room.inner.lock().await.game = Some(finished);
@@ -1405,5 +1480,159 @@ mod tests {
         let game = inner.game.as_ref().expect("the rematch dealt a fresh hand");
         assert_eq!(game.turn(), 3, "a draw rotates the open one seat counter-clockwise");
         assert_eq!(game.opening_tile(), None);
+    }
+
+    /// Rigs a blocked scenario and drives the whole circuit over the wire:
+    /// seat 0 lays the 6|6, then all four seats pass. Team 0 (seats 0 & 2)
+    /// ends on 0 + 6 = 6 pips against team 1's 27 + 19 = 46, so the
+    /// North–South partnership banks 46 points. Returns the terminating
+    /// snapshot every seat observed.
+    async fn play_scored_blocked_hand(
+        lobby: &Lobby,
+        seats: &mut [(PlayerId, mpsc::UnboundedReceiver<Event>)],
+    ) -> PublicGameState {
+        let room = lobby.room_for("a").expect("filled room");
+        {
+            let mut inner = room.inner.lock().await;
+            inner.game = Some(GameState::from_hands([
+                vec![Tile::new(6, 6), Tile::new(0, 0)],
+                vec![Tile::new(5, 5), Tile::new(4, 4), Tile::new(5, 4)],
+                vec![Tile::new(3, 3)],
+                vec![Tile::new(5, 3), Tile::new(4, 3), Tile::new(2, 2)],
+            ]));
+        }
+        lobby
+            .handle_event(
+                seats[0].0,
+                ClientToServer::PlayTile { tile: PublicTile { left: 6, right: 6 }, side: Side::Right },
+            )
+            .await;
+        for seat in [1usize, 2, 3, 0] {
+            lobby.handle_event(seats[seat].0, ClientToServer::PassTurn).await;
+        }
+        let mut ending = None;
+        for (_, rx) in seats.iter_mut() {
+            while let Ok(event) = rx.try_recv() {
+                if let Event::GameStateUpdate { state } = event {
+                    if state.result.is_some() {
+                        ending = Some(state);
+                    }
+                }
+            }
+        }
+        ending.expect("the blocked hand ended with a result on the wire")
+    }
+
+    #[tokio::test]
+    async fn a_played_out_hand_scores_the_rival_pips_without_a_full_reveal() {
+        let (lobby, mut seats) = fill_table().await;
+        for (_, rx) in seats.iter_mut() {
+            while rx.try_recv().is_ok() {}
+        }
+
+        // Rig a one-tile domino-out: seat 2 lays its only tile (the 6|6) and
+        // empties its hand. Rivals (team 1: seats 1 & 3) sit on 3 + 7 = 10
+        // pips and the partner's 1 pip earns nothing.
+        let room = lobby.room_for("a").expect("filled room");
+        {
+            let mut inner = room.inner.lock().await;
+            inner.game = Some(GameState::from_hands([
+                vec![Tile::new(0, 1)],
+                vec![Tile::new(1, 2)],
+                vec![Tile::new(6, 6)],
+                vec![Tile::new(3, 4)],
+            ]));
+        }
+        lobby
+            .handle_event(
+                seats[2].0,
+                ClientToServer::PlayTile { tile: PublicTile { left: 6, right: 6 }, side: Side::Right },
+            )
+            .await;
+
+        for (seat, (_, rx)) in seats.iter_mut().enumerate() {
+            let mut ending = None;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::GameStateUpdate { state } => {
+                        if let Some(result) = state.result {
+                            ending = Some((state, result));
+                        }
+                    }
+                    Event::GameClosed { .. } => {
+                        panic!("seat {seat}: a played-out hand must not reveal every hand")
+                    }
+                    Event::MoveRejected { reason } => panic!("seat {seat} rejected: {reason}"),
+                    _ => {}
+                }
+            }
+            let (state, result) =
+                ending.unwrap_or_else(|| panic!("seat {seat} saw no terminating snapshot"));
+            assert_eq!(result.reason, EndReason::HandEmpty);
+            assert_eq!(result.out, Some(2));
+            assert_eq!(result.winner_team, Some(0), "seat 2's partnership takes the hand");
+            assert_eq!(result.points, 10, "only the rival partnership's pips are banked");
+            assert_eq!(result.hand_pips, [1, 3, 0, 7], "the ending publishes every hand's pips");
+            assert_eq!(state.score.points, [10, 0]);
+        }
+    }
+
+    /// Pulls the live opening snapshot out of a redeal's fan-out.
+    fn drain_opening(seats: &mut [(PlayerId, mpsc::UnboundedReceiver<Event>)]) -> PublicGameState {
+        let mut opening = None;
+        for (_, rx) in seats.iter_mut() {
+            while let Ok(event) = rx.try_recv() {
+                if let Event::GameStateUpdate { state } = event {
+                    assert!(state.result.is_none(), "the redeal snapshot is live");
+                    opening = Some(state);
+                }
+            }
+        }
+        opening.expect("the table saw the redeal snapshot")
+    }
+
+    #[tokio::test]
+    async fn a_match_accumulates_points_across_hands_and_restarts_after_100() {
+        let (lobby, mut seats) = fill_table().await;
+        for (_, rx) in seats.iter_mut() {
+            while rx.try_recv().is_ok() {}
+        }
+
+        // Hand 1 banks its 46 points straight into the terminating snapshot.
+        let ending = play_scored_blocked_hand(&lobby, &mut seats).await;
+        let result = ending.result.expect("hand 1 ended blocked");
+        assert_eq!(result.winner_team, Some(0));
+        assert_eq!(result.points, 46);
+        assert_eq!(ending.score.points, [46, 0], "hand 1 is banked in the match score");
+        assert!(!ending.score.over);
+
+        // Rematch: the score rides into hand 2 — the match keeps running.
+        for (id, _) in seats.iter() {
+            lobby.handle_event(*id, ClientToServer::PlayAgain).await;
+        }
+        let opening = drain_opening(&mut seats);
+        assert_eq!(opening.score.points, [46, 0], "the match score survives the redeal");
+
+        let ending = play_scored_blocked_hand(&lobby, &mut seats).await;
+        assert_eq!(ending.score.points, [92, 0], "hand 2 adds to the same match");
+        assert!(!ending.score.over, "92 is short of the target of 100");
+
+        // Hand 3 crosses 100: the match ends and names its winners.
+        for (id, _) in seats.iter() {
+            lobby.handle_event(*id, ClientToServer::PlayAgain).await;
+        }
+        drain_opening(&mut seats);
+        let ending = play_scored_blocked_hand(&lobby, &mut seats).await;
+        assert_eq!(ending.score.points, [138, 0]);
+        assert!(ending.score.over, "reaching the target ends the match");
+        assert_eq!(ending.score.winner_team, Some(0));
+
+        // Tapping "Play again" after a decided match opens a fresh match.
+        for (id, _) in seats.iter() {
+            lobby.handle_event(*id, ClientToServer::PlayAgain).await;
+        }
+        let opening = drain_opening(&mut seats);
+        assert_eq!(opening.score.points, [0, 0], "the new match starts from zero");
+        assert!(!opening.score.over);
     }
 }
