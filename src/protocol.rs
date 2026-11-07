@@ -75,6 +75,21 @@ impl TryFrom<PublicTile> for game::Tile {
     }
 }
 
+/// A client-supplied partnership preference on `JoinRoom`.
+///
+/// A seat's partnership is `seat % 2` (`team_of`): team 0 holds seats 0 & 2
+/// (north–south), team 1 holds seats 1 & 3 (west–east). Because a full table
+/// is always exactly two seats per partnership, honoring a preference simply
+/// means picking a vacant seat inside that pair; it never requires moving
+/// another player.
+pub fn parse_team(raw: Option<u8>) -> Result<Option<game::Team>, &'static str> {
+    match raw {
+        None => Ok(None),
+        Some(team) if (team as usize) < game::TEAM_COUNT => Ok(Some(team as game::Team)),
+        _ => Err("team must be 0 or 1"),
+    }
+}
+
 /// Inbound messages from a client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -82,6 +97,13 @@ pub enum ClientToServer {
     JoinRoom {
         room: String,
         name: String,
+        /// Best-effort partnership preference (`0` or `1`). Absent or `null`
+        /// means "no preference" — seat the player at the first vacant index,
+        /// which is today's behavior. A full team never refuses a join: the
+        /// player is seated wherever a seat is free, and the client confirms
+        /// its actual side from `RoomState.seats[*].team`.
+        #[serde(default)]
+        team: Option<u8>,
     },
     PlayTile {
         tile: PublicTile,
@@ -143,6 +165,9 @@ pub struct PublicSeat {
     pub player_id: u64,
     pub name: String,
     pub table_side: TableSide,
+    /// Partnership this seat belongs to: `seat % 2` (team 0 = seats 0 & 2,
+    /// team 1 = seats 1 & 3).
+    pub team: u8,
     /// Whether this player has tapped "Play again" since the last deal.
     pub ready: bool,
 }
@@ -255,10 +280,37 @@ mod tests {
     #[test]
     fn inbound_messages_parse_from_tagged_json() {
         let join: ClientToServer = serde_json::from_str(
+            r#"{"type": "JoinRoom", "room": "table-42", "name": "Ada", "team": 1}"#,
+        )
+        .expect("valid JoinRoom with team");
+        assert_eq!(
+            join,
+            ClientToServer::JoinRoom {
+                room: "table-42".into(),
+                name: "Ada".into(),
+                team: Some(1),
+            }
+        );
+
+        let join_no_team: ClientToServer = serde_json::from_str(
             r#"{"type": "JoinRoom", "room": "table-42", "name": "Ada"}"#,
         )
-        .expect("valid JoinRoom");
-        assert_eq!(join, ClientToServer::JoinRoom { room: "table-42".into(), name: "Ada".into() });
+        .expect("valid JoinRoom without team");
+        if let ClientToServer::JoinRoom { team, .. } = join_no_team {
+            assert_eq!(team, None, "absent team means no preference");
+        } else {
+            panic!("expected a JoinRoom message");
+        }
+
+        let join_null_team: ClientToServer = serde_json::from_str(
+            r#"{"type": "JoinRoom", "room": "table-42", "name": "Ada", "team": null}"#,
+        )
+        .expect("valid JoinRoom with null team");
+        if let ClientToServer::JoinRoom { team, .. } = join_null_team {
+            assert_eq!(team, None, "null team means no preference");
+        } else {
+            panic!("expected a JoinRoom message");
+        }
 
         let play: ClientToServer = serde_json::from_str(
             r#"{"type": "PlayTile", "tile": {"left": 3, "right": 4}, "side": "right"}"#,
@@ -277,6 +329,15 @@ mod tests {
 
         let again: ClientToServer = serde_json::from_str(r#"{"type": "PlayAgain"}"#).expect("valid PlayAgain");
         assert_eq!(again, ClientToServer::PlayAgain);
+    }
+
+    #[test]
+    fn parse_team_accepts_valid_partnerships_and_rejects_others() {
+        assert_eq!(parse_team(None), Ok(None));
+        assert_eq!(parse_team(Some(0)), Ok(Some(0)));
+        assert_eq!(parse_team(Some(1)), Ok(Some(1)));
+        assert_eq!(parse_team(Some(2)), Err("team must be 0 or 1"));
+        assert_eq!(parse_team(Some(255)), Err("team must be 0 or 1"));
     }
 
     #[test]
