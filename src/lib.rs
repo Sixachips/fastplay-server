@@ -11,7 +11,9 @@
 //!   * [`lobby`] — thread-safe room/lobby manager: player registration, seat
 //!     assignment, message routing, and broadcast fan-out.
 //!   * [`protocol`] — the public serde JSON contract shared with clients.
-//!   * `main` — Axum routing and the per-connection WebSocket loops.
+//!   * [`net`] — Axum routing and the per-connection WebSocket loops (in the
+//!     library so `tests/mock_client.rs` can drive the real transport).
+//!   * `main` — thin entry point: bind the address, serve [`net::app`].
 //!
 //! Concurrency model:
 //!   * `DashMap` for global lookups (sessions, rooms, player→room routing)
@@ -28,4 +30,5 @@
 
 pub mod game;
 pub mod lobby;
+pub mod net;
 pub mod protocol;
