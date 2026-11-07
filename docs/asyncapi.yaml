@@ -1,0 +1,871 @@
+asyncapi: 3.1.0
+info:
+  title: fastPlay Dominoes WebSocket Protocol
+  version: 0.1.0
+  description: |
+    Wire contract for `fastplay-server`, the authoritative WebSocket backend of
+    the fastPlay double-six dominoes game.
+
+    **Source of truth:** `server/src/protocol.rs` (message shapes),
+    `server/src/lobby.rs` (delivery, ordering, validation) and
+    `server/src/game.rs` (engine semantics). The client mirrors these types in
+    `client/src/protocol.rs`. Any change here must stay in sync with that file.
+
+    ## Transport
+
+    * One WebSocket endpoint (`/ws`) carries the whole protocol in both
+      directions after an HTTP upgrade.
+    * Every frame is a **UTF-8 JSON text object**, discriminated by a
+      top-level `"type"` field (serde internally-tagged enums). No binary
+      frames — they are refused with a `MoveRejected` event.
+    * `Ping`/`Pong` control frames are ignored by the application layer
+      (tungstenite answers pings transparently).
+    * A `PlayerId` is minted server-side at socket-upgrade time and is the
+      only identity the server trusts; commands are always attributed to the
+      seat held by that socket. Clients can never act for another seat.
+
+    ## Session lifecycle
+
+    1. Client connects and sends `JoinRoom` (a connection may seat itself at
+       most once; a second `JoinRoom` is rejected with
+       `"already seated in room ..."`).
+    2. Every join/leave broadcasts a personalized `RoomState` to all seated
+       players (each recipient sees its own seat in `you`).
+    3. When the 4th seat is taken and no live game exists, the room deals in
+       place: each seat receives its private `HandDealt` (sent only once per
+       deal, only into its owner's socket), then everyone receives the same
+       opening `GameStateUpdate`. On the very first join-broadcast the room
+       still reports `phase: "waiting"` because `RoomState` is emitted before
+       the deal; clients must route on `GameStateUpdate.state.result`, not on
+       the phase.
+    4. Players alternate with `PlayTile` / `PassTurn`; each accepted action
+       fans out a fresh `GameStateUpdate` to all four seats.
+    5. Hands end two ways. A seat emptying its hand gives the win to its
+       **partnership** (`result.reason: "hand_empty"`). Four consecutive
+       passes block the hand: the terminating `GameStateUpdate` is immediately
+       followed by a `GameClosed` reveal of every remaining hand
+       (`result.reason: "blocked"`). Either way the result carries the
+       winning team, the points it banked, and every seat's final pip count;
+       the running `score` rides on the same snapshot.
+    6. Rematches do **not** recycle sockets: each seated player sends
+       `PlayAgain`; once all four seats are `ready`, the room deals a fresh
+       game in place and clears all readiness flags. If the match had reached
+       its target, the redeal wipes the score — the same table starts a new
+       match from 0–0.
+    7. A disconnect frees the seat, voids any live game
+       (`result.reason: "abandoned"`, no points) and notifies the room with
+       `OpponentDisconnected` → (optional) `GameStateUpdate` → `RoomState`,
+       in that order.
+
+    ## Partnerships & scoring (Rules.md — standard cumulative, 100 points)
+
+    * Four players form **two fixed partnerships**: team 0 = seats 0 & 2
+      (North–South), team 1 = seats 1 & 3 (West–East); teammates sit opposite.
+      Team of a seat is `seat % 2`.
+    * **Standard / Latin winning**: a blocked hand goes to the team with the
+      lower *combined* pip total (equal totals: draw, no points). Playing out
+      wins the hand for the emptied hand's team.
+    * **Points**: the winning team banks the pips left in the losing team's
+      two hands (`result.points`); draws and voided hands bank nothing. Every
+      seat's remaining pips are published in `result.hand_pips` when the hand
+      ends — the score's raw material, revealed only posthumously.
+    * **Match**: points accumulate across hands in `state.score`; the first
+      team to reach `score.target` (100) ends the match with
+      `score.over: true` and `score.winner_team` set.
+
+    ## Hidden information
+
+    While a game is live, opponent hands are never sent; `GameStateUpdate`
+    exposes only `hand_counts` (tile count per absolute seat index). Hands
+    travel privately in `HandDealt`. Full tile lists leave the server only in
+    the `GameClosed` reveal of a blocked game; every ending — including a
+    played-out win — publishes the *pip totals* via `result.hand_pips`.
+
+    ## Seat model
+
+    Seats are fixed indices `0..=3` and are never compacted. The turn ring
+    `0→1→2→3` walks counter-clockwise around the table (each move passes to
+    the right-hand neighbour):
+
+    | Seat index | `table_side` |
+    |-----------|--------------|
+    | 0 | `north` |
+    | 1 | `west` |
+    | 2 | `south` |
+    | 3 | `east` |
+
+    Vacant seats are simply absent from `RoomState.seats`. After a
+    disconnect the survivors keep their seat numbers and the next joiner
+    takes the first vacant index.
+
+    ## Ordering & delivery guarantees
+
+    * All state mutation and fan-out happen inside the room's mutex, so every
+      seat's socket observes an identical, totally ordered event stream for
+      its room ("broadcast order == commit order").
+    * Outboxes are unbounded and fan-out is non-blocking: a slow client can
+      never stall the room; events to a dead socket are silently dropped and
+      write errors tear the connection down instead of panicking.
+    * `RoomState` is personalized: each player gets its own copy with `you`
+      set to its seat.
+
+    ## Error handling
+
+    Rejections never close the socket; they travel as `MoveRejected` with a
+    human-readable `reason` on the offending socket only. Typical reasons:
+
+    | Situation | Example `reason` |
+    |-----------|------------------|
+    | Malformed / unknown JSON | `unrecognized message: ...` |
+    | Binary frame | `binary frames are not supported` |
+    | Pip out of range (not 0..6) | `pip values must be between 0 and 6` |
+    | Bad room code | `room codes must be 1..=16 characters` |
+    | Bad name | `player names must be 1..=32 characters` |
+    | Rejoin on a seated socket | `already seated in room "code"; disconnect to leave` |
+    | Full room | `room "code" already has all four seats taken` |
+    | Command before joining | `join a room before playing` |
+    | Wrong turn / illegal tile | `it is not your turn`, `tile is not in your hand`, ... |
+    | PlayAgain mid-game | `the current game is still in progress` |
+
+    ## Opening policy (Rules.md, double-six partnership)
+
+    * First hand of a session: the holder of `6|6` must open with it. The
+      server encodes this as `opening_tile: {"left":6,"right":6}` while the
+      board is empty; moves with any other tile are rejected with
+      `WrongOpeningTile` until the double six is laid.
+    * Later hands: the seat that played out (`result.out`) opens the next
+      hand. A hand with no playing-out seat — blocked (won by a partnership
+      on combined pips) or voided — rotates the open one seat
+      counter-clockwise from the previous opener. `opening_tile` is `null`
+      on every hand after the first.
+
+    ## Tile orientation on the wire
+
+    * **In hands** (`HandDealt`, `GameClosed`): normalized `left <= right`,
+      sorted.
+    * **On the board** (`GameStateUpdate.board`): physical left-to-right
+      orientation (`left` faces the left-hand neighbour, `right` the
+      right-hand neighbour).
+    * **In `PlayTile`**: any orientation is accepted; the server normalizes it.
+    * On an empty board the `side` of `PlayTile` is ignored.
+  contact:
+    name: fastPlay repository
+  license:
+    name: MIT or Apache-2.0
+
+servers:
+  development:
+    host: localhost:8080
+    pathname: /ws
+    protocol: ws
+    description: |
+      `cargo run` in `server/` binds the hardcoded `0.0.0.0:8080`
+      (`const BIND_ADDR` in `src/main.rs`; `BIND_ADDR` env is *not* read
+      despite what the README claims) and serves `/ws`.
+  production:
+    host: your-host.example.com
+    pathname: /ws
+    protocol: wss
+    description: |
+      Behind a reverse proxy (Caddy/NGINX): serve the `client/dist/` static
+      bundle and proxy WebSocket upgrades from `/ws` to the game server
+      (`ws://127.0.0.1:8080/ws`). Trunk's dev server does not proxy; a
+      `trunk build --release` bundle has no built-in WS support.
+
+defaultContentType: application/json
+
+channels:
+  gameSocket:
+    address: /ws
+    description: |
+      The single duplex endpoint. After the HTTP upgrade, inbound text frames
+      are `ClientToServer` commands and outbound text frames are
+      `ServerToClient` events, both JSON objects discriminated by `type`.
+    messages:
+      joinRoom:
+        $ref: '#/components/messages/JoinRoom'
+      playTile:
+        $ref: '#/components/messages/PlayTile'
+      passTurn:
+        $ref: '#/components/messages/PassTurn'
+      playAgain:
+        $ref: '#/components/messages/PlayAgain'
+      roomState:
+        $ref: '#/components/messages/RoomState'
+      handDealt:
+        $ref: '#/components/messages/HandDealt'
+      gameStateUpdate:
+        $ref: '#/components/messages/GameStateUpdate'
+      gameClosed:
+        $ref: '#/components/messages/GameClosed'
+      moveRejected:
+        $ref: '#/components/messages/MoveRejected'
+      opponentDisconnected:
+        $ref: '#/components/messages/OpponentDisconnected'
+
+operations:
+  receiveClientCommand:
+    action: receive
+    channel:
+      $ref: '#/channels/gameSocket'
+    summary: The server accepts game commands from a seated (or joining) client.
+    description: |
+      Unparseable JSON and binary frames are refused with a `MoveRejected`
+      event on the same socket; the connection is never closed for a bad
+      command. `PlayTile`, `PassTurn` and `PlayAgain` require the socket to
+      hold a seat — otherwise `MoveRejected` (`join a room before playing` /
+      `you are not seated in this room`).
+    messages:
+      - $ref: '#/channels/gameSocket/messages/joinRoom'
+      - $ref: '#/channels/gameSocket/messages/playTile'
+      - $ref: '#/channels/gameSocket/messages/passTurn'
+      - $ref: '#/channels/gameSocket/messages/playAgain'
+
+  sendServerEvent:
+    action: send
+    channel:
+      $ref: '#/channels/gameSocket'
+    summary: >-
+      The server pushes room and game events. Public events go to all seated
+      players in commit order; `HandDealt` and `MoveRejected` are private to
+      one socket.
+    messages:
+      - $ref: '#/channels/gameSocket/messages/roomState'
+      - $ref: '#/channels/gameSocket/messages/handDealt'
+      - $ref: '#/channels/gameSocket/messages/gameStateUpdate'
+      - $ref: '#/channels/gameSocket/messages/gameClosed'
+      - $ref: '#/channels/gameSocket/messages/moveRejected'
+      - $ref: '#/channels/gameSocket/messages/opponentDisconnected'
+
+components:
+  messages:
+    JoinRoom:
+      title: JoinRoom (client → server)
+      summary: Seat this connection in a room, creating the room if the code is new.
+      description: |
+        The room code is trimmed and must be 1..=16 characters; the name is
+        trimmed and must be 1..=32 characters (both counted in `chars`, so
+        Unicode is fine). Room codes are case-sensitive and reused: joining a
+        vacant existing code re-enters that room. On success every seat
+        receives a personalized `RoomState`; when this join completes a table
+        of four and no game is live, `HandDealt` (private) and
+        `GameStateUpdate` (broadcast) follow.
+      payload:
+        $ref: '#/components/schemas/JoinRoom'
+      examples:
+        - name: create-or-enter a room
+          payload:
+            type: JoinRoom
+            room: table-42
+            name: Ada
+
+    PlayTile:
+      title: PlayTile (client → server)
+      summary: Lay one of your hand's tiles on an end of the board.
+      description: |
+        `tile` may be given in either orientation (the server normalizes it);
+        pips must be within 0..=6. `side` selects which board end to extend;
+        on an empty board it is ignored and the tile starts the chain. The
+        engine validates turn ownership, membership in the sender's hand, and
+        pip matching; rejections come back as `MoveRejected`. On success the
+        room receives a new `GameStateUpdate` (plus `GameClosed` right after
+        it when this was the last tile and everyone else is blocked — the win
+        itself only lands in `state.result`).
+      payload:
+        $ref: '#/components/schemas/PlayTile'
+      examples:
+        - name: extend the right end
+          payload:
+            type: PlayTile
+            tile: { left: 3, right: 4 }
+            side: right
+        - name: flipped orientation is accepted
+          payload:
+            type: PlayTile
+            tile: { left: 4, right: 3 }
+            side: right
+
+    PassTurn:
+      title: PassTurn (client → server)
+      summary: Knock — declare that no tile in hand fits either end.
+      description: |
+        Only legal when the engine agrees no held tile matches `left_end` or
+        `right_end` (illegal passes are rejected). Each pass increments
+        `consecutive_passes`; four passes in a row close the game as blocked:
+        terminating `GameStateUpdate` followed by the all-hands `GameClosed`.
+      payload:
+        $ref: '#/components/schemas/PassTurn'
+      examples:
+        - name: knock
+          payload:
+            type: PassTurn
+
+    PlayAgain:
+      title: PlayAgain (client → server)
+      summary: '"Play again" — mark this seat ready for the next game, no reconnect.'
+      description: |
+        Accepted only when the room's game is finished or absent; mid-game it
+        is rejected with `the current game is still in progress`. Readiness
+        shows up for everyone in the `ready` flag of `RoomState.seats`. When
+        all four seats are ready, the room deals in place: per-seat
+        `HandDealt`, opening `GameStateUpdate`, then a `RoomState` whose
+        readiness flags are already cleared. If the previous match had
+        reached its target (`score.over`), this redeal starts a fresh match:
+        the opening snapshot arrives with `score: {points: [0, 0], ...}`.
+      payload:
+        $ref: '#/components/schemas/PlayAgain'
+      examples:
+        - name: ready for a rematch
+          payload:
+            type: PlayAgain
+
+    RoomState:
+      title: RoomState (server → all seats)
+      summary: Personalized roster snapshot, sent on join, leave, and readiness changes.
+      description: |
+        Each recipient gets its own copy with `you` set to its seat index.
+        Vacant seats are absent from `seats`. `phase` is `playing` only while
+        a live game is dealt; **`waiting` also covers the after-game state** —
+        the server never currently emits `finished`, so clients must detect
+        game-over from `GameStateUpdate.state.result`, not from this field.
+      payload:
+        $ref: '#/components/schemas/RoomState'
+      examples:
+        - name: three of four seats filled, recipient sits north
+          payload:
+            type: RoomState
+            room:
+              room_id: table-42
+              you: 0
+              phase: waiting
+              seats:
+                - { seat: 0, player_id: 1, name: Ada, table_side: north, ready: false }
+                - { seat: 1, player_id: 2, name: Bob, table_side: west, ready: false }
+                - { seat: 3, player_id: 3, name: Cy, table_side: east, ready: true }
+
+    HandDealt:
+      title: HandDealt (server → one seat, private)
+      summary: The recipient's seven private tiles — sent exactly once per deal.
+      description: |
+        Never broadcast, never re-sent: subsequent moves only carry
+        `hand_counts`. Clients are responsible for retiring the tile they
+        place onto the board. Tiles are normalized (`left <= right`) and
+        sorted.
+      payload:
+        $ref: '#/components/schemas/HandDealt'
+      examples:
+        - name: north opens with the double six
+          payload:
+            type: HandDealt
+            seat: 0
+            hand:
+              - { left: 0, right: 1 }
+              - { left: 0, right: 2 }
+              - { left: 1, right: 1 }
+              - { left: 2, right: 5 }
+              - { left: 4, right: 4 }
+              - { left: 5, right: 6 }
+              - { left: 6, right: 6 }
+
+    GameStateUpdate:
+      title: GameStateUpdate (server → all seats)
+      summary: Full public board view after the deal and after every accepted move or pass.
+      description: |
+        Stateless snapshot: apply wholesale, never diff. Opponent hands are
+        hidden — only `hand_counts` per absolute seat index. `result` is
+        `null` while the hand is live; once set the hand is over
+        (`winner_team: null` means draw or void) and it carries the points
+        banked for the winning partnership. `score` is the running cumulative
+        match total on every snapshot; a terminating update already includes
+        the hand it just awarded. `opening_tile` carries the forced first-hand
+        6|6 while the board is empty and is `null` afterwards.
+      payload:
+        $ref: '#/components/schemas/GameStateUpdate'
+      examples:
+        - name: 6|6 laid by seat 0, turn passed counter-clockwise to west
+          payload:
+            type: GameStateUpdate
+            state:
+              turn: 1
+              board: [{ left: 6, right: 6 }]
+              left_end: 6
+              right_end: 6
+              hand_counts: [6, 7, 7, 7]
+              opening_tile: null
+              consecutive_passes: 0
+              result: null
+              score: { points: [0, 0], target: 100, winner_team: null, over: false }
+        - name: seat 2 plays out, its partnership banks the rivals' 11 pips
+          payload:
+            type: GameStateUpdate
+            state:
+              turn: 2
+              board: [{ left: 6, right: 6 }, { left: 6, right: 3 }, { left: 3, right: 3 }]
+              left_end: 6
+              right_end: 3
+              hand_counts: [4, 2, 0, 5]
+              opening_tile: null
+              consecutive_passes: 0
+              result:
+                out: 2
+                winner_team: 0
+                points: 11
+                hand_pips: [4, 6, 0, 5]
+                reason: hand_empty
+              score: { points: [11, 0], target: 100, winner_team: null, over: false }
+
+    GameClosed:
+      title: GameClosed (server → all seats)
+      summary: Blocked-game reveal — every seat's remaining tiles, broadcast once.
+      description: |
+        Sent to all seats immediately after the terminating
+        `GameStateUpdate` of a game that ended `blocked` (four passes in a
+        row). Never sent for `hand_empty` wins or `abandoned` voids — while a
+        game is live this would leak hidden information. `hands` is ordered
+        by absolute seat index and always contains all four entries.
+      payload:
+        $ref: '#/components/schemas/GameClosed'
+      examples:
+        - name: closed game reveal
+          payload:
+            type: GameClosed
+            hands:
+              - { seat: 0, hand: [{ left: 1, right: 4 }] }
+              - { seat: 1, hand: [] }
+              - { seat: 2, hand: [{ left: 0, right: 5 }, { left: 5, right: 5 }] }
+              - { seat: 3, hand: [{ left: 2, right: 6 }] }
+
+    MoveRejected:
+      title: MoveRejected (server → one socket, private)
+      summary: A command was refused; the connection stays open and seated.
+      description: |
+        `reason` is a human-readable English string (engine `MoveError` text
+        or lobby validation text). It targets only the offending socket — it
+        is never a room broadcast. See the error table in the document
+        description for typical values.
+      payload:
+        $ref: '#/components/schemas/MoveRejected'
+      examples:
+        - name: moved out of turn
+          payload:
+            type: MoveRejected
+            reason: it is not your turn
+
+    OpponentDisconnected:
+      title: OpponentDisconnected (server → remaining seats)
+      summary: A seat was freed by a disconnect; broadcast before the follow-up state.
+      description: |
+        Sent first, then — if a live game existed — a terminating
+        `GameStateUpdate` with `result: {winner_team: null, points: 0,
+        reason: abandoned}`, then the refreshed `RoomState` without the
+        departed seat. The disconnected player receives nothing (its socket
+        is gone).
+      payload:
+        $ref: '#/components/schemas/OpponentDisconnected'
+      examples:
+        - name: south left the table
+          payload:
+            type: OpponentDisconnected
+            player: Bob
+            seat: 2
+
+  schemas:
+    Pip:
+      type: integer
+      minimum: 0
+      maximum: 6
+      description: One half of a domino; out-of-range pips are rejected at the wire boundary.
+
+    SeatIndex:
+      type: integer
+      minimum: 0
+      maximum: 3
+      description: >-
+        Fixed absolute seat index (0 north, 1 west, 2 south, 3 east). Seats
+        are never renumbered when somebody leaves.
+
+    PublicTile:
+      type: object
+      description: >-
+        A domino pair on the wire. Orientation meaning depends on context:
+        normalized in hands (`left <= right`), physical left-to-right on the
+        board, any orientation accepted inbound in `PlayTile`.
+      properties:
+        left:
+          $ref: '#/components/schemas/Pip'
+        right:
+          $ref: '#/components/schemas/Pip'
+      required: [left, right]
+      additionalProperties: false
+
+    Side:
+      type: string
+      enum: [left, right]
+      description: Which end of the linear board to extend (ignored on an empty board).
+
+    TableSide:
+      type: string
+      enum: [north, west, south, east]
+      description: Compass position at the table, derived from the fixed seat index.
+
+    RoomPhase:
+      type: string
+      enum: [waiting, playing, finished]
+      description: >-
+        Room lifecycle. The server currently only ever emits `waiting` or
+        `playing`; `finished` is reserved and never sent — a finished game
+        keeps the room `waiting` until the next redeal. Detect game-over via
+        `PublicGameState.result`.
+
+    EndReason:
+      type: string
+      enum: [hand_empty, blocked, abandoned]
+      description: >-
+        How a game ended: a seat emptied its hand (`hand_empty`); all four
+        seats passed in a row (`blocked`, triggers the `GameClosed` reveal);
+        or a seat disconnected mid-game and the hand was voided (`abandoned`).
+
+    GameResult:
+      type: object
+      description: >-
+        Final result of one hand, embedded in `PublicGameState.result`. The
+        hand is won by a partnership, never by a lone seat; the points are
+        the pips left in the losing team's two hands.
+      properties:
+        out:
+          oneOf:
+            - $ref: '#/components/schemas/SeatIndex'
+            - type: 'null'
+          description: >-
+            The seat that emptied its hand (`hand_empty` endings only). A
+            blocked or voided hand has no playing-out seat.
+        winner_team:
+          oneOf:
+            - $ref: '#/components/schemas/TeamIndex'
+            - type: 'null'
+          description: >-
+            The winning partnership, or `null` for a draw (blocked hands with
+            equal team pip totals) or a voided game.
+        points:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: >-
+            Points banked by `winner_team` for this hand: the combined pips
+            still held by the losing partnership. Zero on draws and voids.
+        hand_pips:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+          description: >-
+            Pips still held per absolute seat when the hand ended. Public
+            from the moment the hand is over — this is what the points are
+            computed from.
+        reason:
+          $ref: '#/components/schemas/EndReason'
+      required: [out, winner_team, points, hand_pips, reason]
+      additionalProperties: false
+
+    TeamIndex:
+      type: integer
+      minimum: 0
+      maximum: 1
+      description: >-
+        Partnership index: team 0 = seats 0 & 2 (North–South), team 1 = seats
+        1 & 3 (West–East). The team of a seat is `seat % 2`.
+
+    PublicMatchScore:
+      type: object
+      description: >-
+        Cumulative partnership score across the hands of one match, riding on
+        every `GameStateUpdate`. Standard cumulative scoring: the first team
+        to reach `target` points wins the match.
+      properties:
+        points:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            type: integer
+            minimum: 0
+          description: Points banked per partnership (`points[0]` is team 0).
+        target:
+          type: integer
+          description: Points needed to win the match (currently 100).
+        winner_team:
+          oneOf:
+            - $ref: '#/components/schemas/TeamIndex'
+            - type: 'null'
+          description: The match-winning partnership, set only when `over` is true.
+        over:
+          type: boolean
+          description: Whether a partnership has reached `target`.
+      required: [points, target, winner_team, over]
+      additionalProperties: false
+
+    PlayerId:
+      type: integer
+      minimum: 0
+      description: >-
+        Server-minted identity (`u64`, monotonic per connection since boot).
+        Opaque to clients; used only inside `RoomState.seats`.
+
+    PublicSeat:
+      type: object
+      description: One occupied seat of a room. Vacant seats are omitted entirely.
+      properties:
+        seat:
+          $ref: '#/components/schemas/SeatIndex'
+        player_id:
+          $ref: '#/components/schemas/PlayerId'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 32
+        table_side:
+          $ref: '#/components/schemas/TableSide'
+        ready:
+          type: boolean
+          description: Whether this player tapped `PlayAgain` since the last deal.
+      required: [seat, player_id, name, table_side, ready]
+      additionalProperties: false
+
+    PublicRoomState:
+      type: object
+      description: >-
+        Room roster snapshot, personalized per recipient
+        (`you` = recipient's seat).
+      properties:
+        room_id:
+          type: string
+          minLength: 1
+          maxLength: 16
+          description: Normalized (trimmed) room code.
+        you:
+          $ref: '#/components/schemas/SeatIndex'
+        phase:
+          $ref: '#/components/schemas/RoomPhase'
+        seats:
+          type: array
+          maxItems: 4
+          items:
+            $ref: '#/components/schemas/PublicSeat'
+      required: [room_id, you, phase, seats]
+      additionalProperties: false
+
+    RoomState:
+      type: object
+      description: Outbound `RoomState` envelope.
+      properties:
+        type:
+          const: RoomState
+        room:
+          $ref: '#/components/schemas/PublicRoomState'
+      required: [type, room]
+      additionalProperties: false
+
+    PublicGameState:
+      type: object
+      description: >-
+        Complete public view of the running game. Broadcast to all four
+        seats after the deal and after every accepted `PlayTile` / `PassTurn`
+        — clients replace their whole board view wholesale.
+      properties:
+        turn:
+          $ref: '#/components/schemas/SeatIndex'
+          description: Seat whose move it is.
+        board:
+          type: array
+          minItems: 0
+          maxItems: 28
+          items:
+            $ref: '#/components/schemas/PublicTile'
+          description: >-
+            The played chain, physically oriented left to right
+            (`left` faces the left-hand neighbour).
+        left_end:
+          oneOf:
+            - $ref: '#/components/schemas/Pip'
+            - type: 'null'
+          description: Open pip at the board's left end (`null` before the first tile).
+        right_end:
+          oneOf:
+            - $ref: '#/components/schemas/Pip'
+            - type: 'null'
+          description: Open pip at the board's right end (`null` before the first tile).
+        hand_counts:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: integer
+            minimum: 0
+            maximum: 7
+          description: >-
+            Remaining tiles per absolute seat (`hand_counts[0]` is seat 0).
+            The only window into hidden hands while the game is live.
+        opening_tile:
+          oneOf:
+            - $ref: '#/components/schemas/PublicTile'
+            - type: 'null'
+          description: >-
+            Forced opening tile while the board is empty: `{left:6,right:6}`
+            on the session's first hand, `null` on every later hand. Until it
+            is laid, other tiles are refused with a wrong-opening-tile
+            rejection.
+        consecutive_passes:
+          type: integer
+          minimum: 0
+          maximum: 4
+          description: Passes in a row (reset by any accepted play). Four closes the game.
+        result:
+          oneOf:
+            - $ref: '#/components/schemas/GameResult'
+            - type: 'null'
+          description: Present once the hand has ended.
+        score:
+          $ref: '#/components/schemas/PublicMatchScore'
+      required:
+        [turn, board, left_end, right_end, hand_counts, opening_tile, consecutive_passes, result, score]
+      additionalProperties: false
+
+    GameStateUpdate:
+      type: object
+      description: Outbound `GameStateUpdate` envelope.
+      properties:
+        type:
+          const: GameStateUpdate
+        state:
+          $ref: '#/components/schemas/PublicGameState'
+      required: [type, state]
+      additionalProperties: false
+
+    ClosedHand:
+      type: object
+      description: One seat's remaining tiles, revealed only when a game closes blocked.
+      properties:
+        seat:
+          $ref: '#/components/schemas/SeatIndex'
+        hand:
+          type: array
+          minItems: 0
+          maxItems: 7
+          items:
+            $ref: '#/components/schemas/PublicTile'
+      required: [seat, hand]
+      additionalProperties: false
+
+    GameClosed:
+      type: object
+      description: Outbound `GameClosed` envelope (blocked games only).
+      properties:
+        type:
+          const: GameClosed
+        hands:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            $ref: '#/components/schemas/ClosedHand'
+          description: All four seats in seat-index order.
+      required: [type, hands]
+      additionalProperties: false
+
+    HandDealt:
+      type: object
+      description: Outbound private-hand envelope.
+      properties:
+        type:
+          const: HandDealt
+        seat:
+          $ref: '#/components/schemas/SeatIndex'
+          description: The recipient's seat (equals `RoomState.you` for this socket).
+        hand:
+          type: array
+          minItems: 7
+          maxItems: 7
+          items:
+            $ref: '#/components/schemas/PublicTile'
+          description: Seven normalized, sorted tiles — the full 28-tile set splits 7×4.
+      required: [type, seat, hand]
+      additionalProperties: false
+
+    MoveRejected:
+      type: object
+      description: Outbound rejection envelope (private to the offending socket).
+      properties:
+        type:
+          const: MoveRejected
+        reason:
+          type: string
+          description: Human-readable English explanation.
+      required: [type, reason]
+      additionalProperties: false
+
+    OpponentDisconnected:
+      type: object
+      description: Outbound departure notice, broadcast to the remaining seats.
+      properties:
+        type:
+          const: OpponentDisconnected
+        player:
+          type: string
+          description: Display name of the departed player.
+        seat:
+          $ref: '#/components/schemas/SeatIndex'
+      required: [type, player, seat]
+      additionalProperties: false
+
+    JoinRoom:
+      type: object
+      description: Inbound command — seat this connection in a room.
+      properties:
+        type:
+          const: JoinRoom
+        room:
+          type: string
+          minLength: 1
+          maxLength: 16
+          description: Room code; trimmed server-side, 1..=16 chars after trim.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: Display name; trimmed server-side, 1..=32 chars after trim.
+      required: [type, room, name]
+      additionalProperties: false
+
+    PlayTile:
+      type: object
+      description: Inbound command — lay a tile.
+      properties:
+        type:
+          const: PlayTile
+        tile:
+          $ref: '#/components/schemas/PublicTile'
+        side:
+          $ref: '#/components/schemas/Side'
+      required: [type, tile, side]
+      additionalProperties: false
+
+    PassTurn:
+      type: object
+      description: Inbound command — pass (knock).
+      properties:
+        type:
+          const: PassTurn
+      required: [type]
+      additionalProperties: false
+
+    PlayAgain:
+      type: object
+      description: Inbound command — signal readiness for the next game in place.
+      properties:
+        type:
+          const: PlayAgain
+      required: [type]
+      additionalProperties: false
