@@ -10,7 +10,10 @@
 //!   empty, so passing is the only alternative to playing).
 //! * **Two fixed partnerships** (`Rules.md`): seats 0 & 2 (North–South) play
 //!   against seats 1 & 3 (West–East); teammates sit opposite each other and
-//!   every hand is won by a *team*, not a seat.
+//!   every hand is won by a *team*, not a seat. The lobby may let a joiner
+//!   claim a partnership preference, but because the team of a seat is
+//!   `seat % 2` and the table is fixed at four seats, any full table is still
+//!   exactly two-vs-two — no engine change is required.
 //! * A single linear board ("the train") with a left and a right end. The
 //!   first tile played sets both ends and the requested side is ignored.
 //! * The first hand of a session is opened by the seat holding the 6|6, which

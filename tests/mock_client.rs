@@ -156,7 +156,11 @@ async fn join_all(url: &str, names: [&'static str; 4]) -> Vec<MockClient> {
     let mut clients = Vec::new();
     for (index, name) in names.iter().enumerate() {
         let mut client = MockClient::connect(url, name).await;
-        let cmd = ClientToServer::JoinRoom { room: "match".into(), name: (*name).into() };
+        let cmd = ClientToServer::JoinRoom {
+            room: "match".into(),
+            name: (*name).into(),
+            team: None,
+        };
         client.send(&cmd).await;
         client.await_roster().await;
         assert_eq!(client.you, index, "joins seat players in order");
@@ -366,7 +370,11 @@ async fn binary_and_garbage_frames_are_rejected_without_killing_the_socket() {
 
     // The socket survives both insults: a real join still seats the client.
     client
-        .send(&ClientToServer::JoinRoom { room: "solid".into(), name: "Ada".into() })
+        .send(&ClientToServer::JoinRoom {
+            room: "solid".into(),
+            name: "Ada".into(),
+            team: None,
+        })
         .await;
     client.await_roster().await;
     assert_eq!(client.you, 0, "still seatable after bad frames");
