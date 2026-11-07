@@ -13,3 +13,8 @@ dashmap = "6"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
 futures-util = "0.3"
+
+[dev-dependencies]
+# WebSocket client stack for the mock clients in `tests/` — kept in lockstep
+# with the tungstenite version Axum 0.8 speaks.
+tokio-tungstenite = "0.28"
