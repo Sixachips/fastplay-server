@@ -30,10 +30,13 @@ use dashmap::DashMap;
 use rand::{seq::SliceRandom, thread_rng};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::game::{GameState, MatchScore, MoveError, Outcome, Seat, SEAT_COUNT, Side, TableSide, Tile};
+use crate::game::{
+    GameState, MatchScore, MoveError, Outcome, Seat, SEAT_COUNT, Side, TableSide, Team, Tile,
+    team_of, team_seats,
+};
 use crate::protocol::{
-    closed_hands_view, game_state_view, ClientToServer, PublicRoomState, PublicSeat, RoomPhase,
-    ServerToClient,
+    closed_hands_view, game_state_view, parse_team, ClientToServer, PublicRoomState, PublicSeat,
+    RoomPhase, ServerToClient,
 };
 
 /// A client's connection identity. Issued by [`Lobby::next_player_id`] when
@@ -142,8 +145,18 @@ impl Lobby {
     /// engine values, and hands validated work to the owning room.
     pub async fn handle_event(&self, id: PlayerId, event: ClientToServer) {
         match event {
-            ClientToServer::JoinRoom { room, name } => {
-                let _ = self.join(id, &room, &name).await; // rejection is both returned and queued
+            ClientToServer::JoinRoom {
+                room,
+                name,
+                team,
+            } => {
+                // Validate the team preference before touching any room, so a
+                // malformed preference cannot leave an empty room behind.
+                let Ok(preferred_team) = parse_team(team) else {
+                    self.reject(id, "team must be 0 or 1".to_owned());
+                    return;
+                };
+                let _ = self.join(id, &room, &name, preferred_team).await; // rejection is both returned and queued
             }
             ClientToServer::PlayTile { tile, side } => {
                 let Ok(tile) = Tile::try_from(tile) else {
@@ -193,7 +206,13 @@ impl Lobby {
     /// index is echoed to every seat through `RoomState` broadcasts, and the
     /// rejection reason (if any) both goes back to the caller and reaches the
     /// connection as a `MoveRejected` event.
-    async fn join(&self, id: PlayerId, raw_code: &str, raw_name: &str) -> Result<u8, String> {
+    async fn join(
+        &self,
+        id: PlayerId,
+        raw_code: &str,
+        raw_name: &str,
+        preferred_team: Option<Team>,
+    ) -> Result<u8, String> {
         // A connection seats itself at most once; re-binding would leave a
         // ghost seat in the old room.
         if let Some(binding) = self.room_binding(&id) {
@@ -227,7 +246,7 @@ impl Lobby {
             // The connection is already gone: nothing left to seat or rebind.
             return Err("the connection is no longer registered".to_owned());
         };
-        match room.join(id, name, outbox).await {
+        match room.join(id, name, outbox, preferred_team).await {
             Ok(seat) => {
                 if self.connections.contains_key(&id) {
                     self.set_room_binding(id, code.clone());
@@ -311,13 +330,22 @@ impl Room {
     /// fresh game as soon as the table is full. Per-seat private hands are
     /// sent straight into that seat's outbox; they never leave the room over
     /// anyone else's channel.
-    async fn join(&self, player: PlayerId, name: &str, outbox: Outbox) -> Result<u8, String> {
+    async fn join(
+        &self,
+        player: PlayerId,
+        name: &str,
+        outbox: Outbox,
+        preferred_team: Option<Team>,
+    ) -> Result<u8, String> {
         let mut inner = self.inner.lock().await;
 
         if inner.seats.iter().any(|o| o.as_ref().is_some_and(|o| o.player_id == player)) {
             return Err("this connection already holds a seat".to_owned());
         }
-        let Some(seat) = inner.seats.iter().position(Option::is_none) else {
+        // Honor the partnership preference: pick a vacant seat inside that
+        // team first, then fall back to the first vacant seat at the table.
+        // Never renumber or evict an occupied seat.
+        let Some(seat) = pick_seat(&inner.seats, preferred_team) else {
             return Err(format!("room {:?} already has all four seats taken", self.code));
         };
         // The seat ring walks counter-clockwise (rules.md): each seat hands the
@@ -552,6 +580,7 @@ fn broadcast_room_state(code: &str, inner: &RoomInner) {
                 player_id: o.player_id,
                 name: o.name.clone(),
                 table_side: o.table_side,
+                team: team_of(seat) as u8,
                 ready: o.ready,
             })
         })
@@ -577,6 +606,21 @@ fn room_phase(inner: &RoomInner) -> RoomPhase {
         Some(game) if !game.is_finished() => RoomPhase::Playing,
         _ => RoomPhase::Waiting,
     }
+}
+
+/// Pick a seat honoring a partnership preference: a vacant seat inside that
+/// team first, then the first vacant seat anywhere at the table. A full
+/// requested team never refuses a join — the player lands wherever a seat is
+/// free. Returns `None` only when all four seats are occupied. Occupied seats
+/// are never renumbered or evicted, so the table is always exactly two seats
+/// per team once full (`team_of(seat) == seat % 2`).
+fn pick_seat(seats: &[Option<Occupant>; SEAT_COUNT], preferred: Option<Team>) -> Option<Seat> {
+    if let Some(team) = preferred {
+        if let Some(seat) = team_seats(team).into_iter().find(|&seat| seats[seat].is_none()) {
+            return Some(seat);
+        }
+    }
+    seats.iter().position(Option::is_none)
 }
 
 /// Trims a client-supplied room code and enforces the length bound.
@@ -617,7 +661,7 @@ mod tests {
         let lobby = Lobby::new();
         let mut seats = connections(&lobby, 4).await;
         for (id, _) in seats.iter_mut() {
-            lobby.join(*id, "a", &format!("p{id}")).await.expect("seat available");
+            lobby.join(*id, "a", &format!("p{id}"), None).await.expect("seat available");
         }
         (lobby, seats)
     }
@@ -658,7 +702,7 @@ mod tests {
     async fn full_room_rejects_fifth_seeker() {
         let (lobby, mut _seats) = fill_table().await;
         let (latecomer, mut rx5) = connections(&lobby, 1).await.pop().expect("one receiver");
-        lobby.join(latecomer, "a", "latecomer").await.expect_err("room is full");
+        lobby.join(latecomer, "a", "latecomer", None).await.expect_err("room is full");
         assert!(matches!(rx5.try_recv(), Ok(Event::MoveRejected { .. })));
     }
 
@@ -749,7 +793,7 @@ mod tests {
         let lobby = Lobby::new();
         let seats = connections(&lobby, 2).await;
         let solo = seats[0].0;
-        lobby.join(solo, "prune", "solo").await.expect("seat");
+        lobby.join(solo, "prune", "solo", None).await.expect("seat");
         assert!(lobby.room_exists("prune"));
         lobby.handle_disconnect(solo).await;
         // Never seated, so this departure must not be what empties the room.
@@ -761,16 +805,120 @@ mod tests {
     async fn malformed_room_code_and_name_are_rejected() {
         let lobby = Lobby::new();
         let (id, mut rx) = connections(&lobby, 1).await.pop().expect("one receiver");
-        assert!(lobby.join(id, "   ", "ok name").await.is_err(), "a blank room code is refused");
+        assert!(lobby.join(id, "   ", "ok name", None).await.is_err(), "a blank room code is refused");
         assert!(matches!(rx.try_recv(), Ok(Event::MoveRejected { .. })));
         assert!(
-            lobby.join(id, "waaaaaaaaaaaaaaaaaaaaaaaaaay-too-long", "ok name").await.is_err(),
+            lobby.join(id, "waaaaaaaaaaaaaaaaaaaaaaaaaay-too-long", "ok name", None).await.is_err(),
             "an over-long room code is refused"
         );
         assert!(matches!(rx.try_recv(), Ok(Event::MoveRejected { .. })));
-        assert!(lobby.join(id, "ok", "     ").await.is_err(), "a blank name is refused");
+        assert!(lobby.join(id, "ok", "     ", None).await.is_err(), "a blank name is refused");
         assert!(matches!(rx.try_recv(), Ok(Event::MoveRejected { .. })));
         assert!(!lobby.room_exists("ok"), "a refused join must not leave a room behind");
+    }
+
+    #[tokio::test]
+    async fn team_preference_seats_each_player_on_requested_partnership() {
+        let lobby = Lobby::new();
+        let mut seats = connections(&lobby, 4).await;
+        // Interleave teams so the fall-back path is also exercised implicitly:
+        // west, north, east, south — each gets its requested partnership.
+        let prefs = [Some(1), Some(0), Some(1), Some(0)];
+        for ((id, _), pref) in seats.iter_mut().zip(prefs) {
+            lobby
+                .join(*id, "a", &format!("p{id}"), pref)
+                .await
+                .expect("team seat available");
+        }
+        // Single drain per seat: confirm the side and count the private hand.
+        for ((id, rx), pref) in seats.iter_mut().zip(prefs) {
+            let mut team = None;
+            let mut seat = None;
+            let mut seat_count = 0usize;
+            let mut hands = 0usize;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::RoomState { room } => {
+                        seat_count = room.seats.len();
+                        if let Some(me) = room.seats.iter().find(|s| s.player_id == *id) {
+                            team = Some(me.team);
+                            seat = Some(me.seat);
+                        }
+                    }
+                    Event::HandDealt { .. } => hands += 1,
+                    _ => {}
+                }
+            }
+            let (team, seat) =
+                (team.expect("a roster arrived"), seat.expect("the joiner is listed"));
+            assert_eq!(team, pref.unwrap() as u8, "team preference honored");
+            assert_eq!(team, seat % 2, "team matches seat parity");
+            assert_eq!(seat_count, SEAT_COUNT, "all four seats filled");
+            assert_eq!(hands, 1, "each seat got exactly one private hand");
+        }
+    }
+
+    #[tokio::test]
+    async fn full_requested_team_falls_back_to_any_vacant_seat() {
+        let lobby = Lobby::new();
+        // Both seats of team 1 (west & east) are taken by two preference joins.
+        let mut team1_ids = Vec::new();
+        for _ in 0..2 {
+            let (id, _) = connections(&lobby, 1).await.pop().expect("one receiver");
+            lobby
+                .join(id, "a", "t1", Some(1))
+                .await
+                .expect("team-1 seat available");
+            team1_ids.push(id);
+        }
+        // A third team-1 seeker finds both team seats taken and is seated
+        // wherever a seat is free — never refused for a full team.
+        let (seeker, mut rx) = connections(&lobby, 1).await.pop().expect("one receiver");
+        let seat = lobby
+            .join(seeker, "a", "t1-fallback", Some(1))
+            .await
+            .expect("fallback seat available");
+        assert!(
+            seat % 2 == 0,
+            "the fallback seat belongs to the other team, seat {seat}"
+        );
+        let mut roster = None;
+        while let Ok(event) = rx.try_recv() {
+            if let Event::RoomState { room } = event {
+                roster = Some(room);
+            }
+        }
+        let room = roster.expect("roster arrived");
+        let me = room
+            .seats
+            .iter()
+            .find(|s| s.player_id == seeker)
+            .expect("the fallback joiner is listed");
+        assert_eq!(me.team, 0, "the roster reports the seat the fallback joiner actually got");
+    }
+
+    #[tokio::test]
+    async fn invalid_team_is_rejected_before_any_room_is_created() {
+        let lobby = Lobby::new();
+        let (id, mut rx) = connections(&lobby, 1).await.pop().expect("one receiver");
+        lobby
+            .handle_event(
+                id,
+                ClientToServer::JoinRoom {
+                    room: "nope".into(),
+                    name: "Ada".into(),
+                    team: Some(7),
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(Event::MoveRejected { reason }) if reason == "team must be 0 or 1"
+            ),
+            "an invalid team is refused on the sender's socket only"
+        );
+        assert!(!lobby.room_exists("nope"), "a refused join leaves no room behind");
     }
 
     /// First `(tile, side)` placement fitting the public ends, mirroring what
@@ -1072,7 +1220,7 @@ mod tests {
         // fresh tail or a compacted slot.
         let (refugee, mut refugee_rx) = connections(&lobby, 1).await.pop().expect("one receiver");
         assert_eq!(
-            lobby.join(refugee, "a", "refugee").await.expect("the hole is fillable"),
+            lobby.join(refugee, "a", "refugee", None).await.expect("the hole is fillable"),
             1,
             "the replacement must inherit the departed seat number"
         );
