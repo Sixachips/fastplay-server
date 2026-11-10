@@ -173,9 +173,9 @@ servers:
     pathname: /ws
     protocol: ws
     description: |
-      `cargo run` in `server/` binds the hardcoded `0.0.0.0:8080`
-      (`const BIND_ADDR` in `src/main.rs`; `BIND_ADDR` env is *not* read
-      despite what the README claims) and serves `/ws`.
+      `cargo run` in `server/` binds `127.0.0.1:8080` by default and serves
+      `/ws`. Set the `BIND_ADDR` environment variable (e.g.
+      `BIND_ADDR=0.0.0.0:8080`) to change the address.
   production:
     host: your-host.example.com
     pathname: /ws

@@ -132,18 +132,19 @@ cargo build
 cargo run
 ```
 
-The server binds to `0.0.0.0:8080` by default. It will print:
+The server binds to `127.0.0.1:8080` by default (localhost only). It will print:
 
 ```
-fastplay headless dominoes server listening on ws://0.0.0.0:8080/ws
+fastplay headless dominoes server listening on ws://127.0.0.1:8080/ws
 ```
 
 ### Custom bind address
 
-Override the bind address at runtime:
+Override the bind address at runtime with the `BIND_ADDR` environment variable:
 
 ```bash
-BIND_ADDR=127.0.0.1:8080 cargo run
+# Listen on all interfaces (exposes the server directly; no reverse proxy)
+BIND_ADDR=0.0.0.0:8080 cargo run
 ```
 
 ---
@@ -211,4 +212,4 @@ This project is open source. See the LICENSE file (or add one if you haven't alr
 - The server expects a client/frontend that knows the wire protocol documented in `protocol.rs`. The client repository is separate.
 - Room codes are user-supplied strings up to 16 characters; they are trimmed and validated on join.
 - Player names are 1–32 characters; empty or overly long names are rejected.
-- The server binds to `0.0.0.0:8080` by default; change via the `BIND_ADDR` environment variable.
+- The server binds to `127.0.0.1:8080` by default; change via the `BIND_ADDR` environment variable.

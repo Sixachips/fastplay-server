@@ -12,7 +12,7 @@ Compact guidance for working in `server/` (`fastplay-server`).
 
 | Task | Command |
 |------|---------|
-| Run server (`ws://0.0.0.0:8080/ws`) | `cargo run` |
+| Run server (`ws://127.0.0.1:8080/ws`) | `cargo run` |
 | Run all 44 unit + 2 wire-integration tests | `cargo test` |
 | Run a single test | `cargo test <name>` (e.g. `cargo test play_again_redeals`) |
 | Lint / typecheck | `cargo clippy --all-targets` |
@@ -21,7 +21,7 @@ Compact guidance for working in `server/` (`fastplay-server`).
 
 ## Non-Obvious Quirks & Stale Docs
 
-- **`BIND_ADDR` is hardcoded**: Despite `README.md` claiming `BIND_ADDR=127.0.0.1:8080 cargo run` works, `src/main.rs` defines `const BIND_ADDR: &str = "0.0.0.0:8080"` and never reads `std::env::var`.
+- **`BIND_ADDR` env override**: `src/main.rs` reads `BIND_ADDR` and falls back to `DEFAULT_BIND_ADDR = "127.0.0.1:8080"` (localhost only, so nginx fronts it). Set `BIND_ADDR=0.0.0.0:8080` to listen on all interfaces.
 - **`docs/asyncapi.yaml` mirrors the wire contract**: the full AsyncAPI 3.1 spec (messages, schemas, ordering, error table) lives in `docs/asyncapi.yaml`, validated with `npx @asyncapi/cli validate docs/asyncapi.yaml`. It is derived from `src/protocol.rs` + `src/lobby.rs` — when you change the protocol, update the spec in the same commit.
 - **`README.md` protocol tables are now in sync** with `src/protocol.rs` (inbound `PlayAgain`, outbound `GameClosed { hands }`, and `PublicSeat.ready` are covered), but still treat `src/protocol.rs` as the source of truth.
 - **`RoomPhase::Finished` is never emitted**: `lobby::room_phase()` only returns `RoomPhase::Playing` (when a live game is active) or `RoomPhase::Waiting` (all other states, including after a game ends). Furthermore, on the 4th player's join, `RoomState` is broadcast *before* `deal_fresh_game`, so its phase still reads `waiting`. Clients detect active/ended games from `GameStateUpdate.state.result`, not `RoomState.phase`.
